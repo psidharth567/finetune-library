@@ -1,0 +1,31 @@
+version: 1
+task: cpt
+model: {name: gemma4-26b-a4b-it}
+data:
+  format: text
+  path: data/dummy_cpt.jsonl
+  cache_dir: .cache/prepared
+  packing: true
+  drop_remainder: false
+training:
+  output_dir: outputs/parity-gemma4-26b-liger
+  max_seq_length: 2048
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 1
+  log_every_steps: 1
+  benchmark_warmup_steps: 0
+  benchmark_steps: 1
+lora: {rank: 32, alpha: 64, dropout: 0.0, expert_rank: 4}
+optimizer: {name: adamw, learning_rate: 0.0002}
+scheduler: {name: cosine, warmup_ratio: 0.03}
+distributed: {strategy: hsdp, shard_size: 2, replicate_size: 4}
+runtime:
+  backend: native
+  attention: sdpa
+  model_kernels: liger
+  loss: cross_entropy
+  experts: eager
+  torch_compile: false
+  gradient_checkpointing: true
+checkpoint: {save_every_steps: 0, save_final: false}

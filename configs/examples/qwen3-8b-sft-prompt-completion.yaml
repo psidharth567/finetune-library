@@ -1,0 +1,32 @@
+version: 1
+task: sft
+model:
+  name: qwen3-8b
+data:
+  format: prompt_completion
+  path: data/dummy_sft.jsonl
+  cache_dir: .cache/prepared
+  packing: false
+  drop_remainder: false
+training:
+  output_dir: outputs/qwen3-8b-sft-prompt-completion
+  max_seq_length: 512
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 2
+  log_every_steps: 1
+lora: {rank: 32, alpha: 64, dropout: 0.0, expert_rank: 4}
+optimizer:
+  name: adamw
+  learning_rate: 0.0002
+scheduler: {name: cosine, warmup_ratio: 0.03}
+distributed: {strategy: ddp}
+runtime:
+  backend: unsloth
+  attention: sdpa
+  model_kernels: auto
+  loss: fused_linear_cross_entropy
+  experts: eager
+  torch_compile: false
+  gradient_checkpointing: false
+checkpoint: {save_every_steps: 0, save_final: true}

@@ -1,0 +1,32 @@
+version: 1
+task: cpt
+model: {name: qwen3-8b}
+data:
+  format: text
+  path: data/cpt_train_longest_20k/train_packed_2048.jsonl
+  cache_dir: .cache/benchmark-prepared
+  max_samples: 512
+  packing: true
+  drop_remainder: true
+training:
+  output_dir: outputs/benchmark-qwen3-8b-native-fused-loss-batch4
+  max_seq_length: 2048
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 1
+  max_steps: 60
+  log_every_steps: 10
+  benchmark_warmup_steps: 10
+  benchmark_steps: 50
+lora: {rank: 32, alpha: 64, dropout: 0.0, expert_rank: 4}
+optimizer: {name: adamw, learning_rate: 0.0002}
+scheduler: {name: cosine, warmup_ratio: 0.03}
+distributed: {strategy: ddp}
+runtime:
+  backend: native
+  attention: sdpa
+  model_kernels: native
+  loss: fused_linear_cross_entropy
+  experts: eager
+  torch_compile: false
+  gradient_checkpointing: true
+checkpoint: {save_every_steps: 0, save_final: false}

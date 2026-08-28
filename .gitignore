@@ -1,0 +1,19 @@
+.env
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated training material is intentionally outside the source lifecycle.
+outputs/
+logs/
+wheels/
+data/*_packed*/
+data/*tokenized*/
+
+# Keep small checked-in fixtures.
+!data/dummy_cpt.jsonl
+!data/dummy_sft.jsonl
