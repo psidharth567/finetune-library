@@ -48,6 +48,12 @@ def scaffold_project_config(
 
     spec = resolve_model(model_name)
     lr = spec.recommended_lr_cpt if task == Task.CPT else spec.recommended_lr_sft
+    # Hard-optimized defaults: liger auto, fused loss, grouped_mm for MoE, no ckpt where memory-safe (<=26B)
+    is_large = "32b" in model_name.lower() or "31b" in model_name.lower()
+    grad_ckpt = True if is_large else False
+    experts_default = "grouped_mm" if spec.moe else "auto"
+    # Use native backend for hard wins (liger incompatible with unsloth)
+    hard_backend = "native"
     config: dict[str, Any] = {
         "version": 1,
         "task": task.value,
@@ -85,13 +91,13 @@ def scaffold_project_config(
         "scheduler": {"name": "cosine", "warmup_ratio": 0.03},
         "distributed": {"strategy": "ddp"},
         "runtime": {
-            "backend": runtime_backend,
+            "backend": hard_backend,
             "attention": "sdpa",
             "model_kernels": "auto",
             "loss": "fused_linear_cross_entropy",
-            "experts": "auto",
+            "experts": experts_default,
             "torch_compile": False,
-            "gradient_checkpointing": True,
+            "gradient_checkpointing": grad_ckpt,
         },
         "checkpoint": {"save_every_steps": 0, "save_final": True},
         "logging": {

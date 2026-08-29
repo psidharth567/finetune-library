@@ -1,20 +1,24 @@
 version: 1
 task: cpt
 model:
-  name: qwen3-8b
+  name: gemma4-26b-a4b-it
+  cache_dir: /projects/data/llmteam/sidharth/sycophancy/eval/.cache/huggingface
 data:
   format: text
-  path: data/dummy_cpt.jsonl
-  cache_dir: .cache/prepared
+  path: data/cpt_train_longest_20k/train_packed_2048.jsonl
+  cache_dir: .cache/benchmark-prepared
+  max_samples: 64
   packing: true
-  drop_remainder: false
+  drop_remainder: true
 training:
-  output_dir: outputs/qwen3-8b-cpt
+  output_dir: outputs/benchmark-gemma4-26b-fused-nc
   max_seq_length: 2048
   per_device_batch_size: 1
   gradient_accumulation_steps: 1
-  max_steps: 10
-  log_every_steps: 1
+  max_steps: 15
+  log_every_steps: 5
+  benchmark_warmup_steps: 5
+  benchmark_steps: 10
 lora:
   rank: 32
   alpha: 64
@@ -23,7 +27,6 @@ lora:
 optimizer:
   name: adamw
   learning_rate: 0.0002
-  weight_decay: 0.01
 scheduler:
   name: cosine
   warmup_ratio: 0.03
@@ -32,12 +35,11 @@ distributed:
 runtime:
   backend: native
   attention: sdpa
-  model_kernels: auto
+  model_kernels: native
   loss: fused_linear_cross_entropy
-  experts: auto
+  experts: grouped_mm
   torch_compile: false
   gradient_checkpointing: false
-  use_cache: false
 checkpoint:
   save_every_steps: 0
-  save_final: true
+  save_final: false

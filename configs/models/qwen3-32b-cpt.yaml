@@ -15,19 +15,28 @@ training:
   gradient_accumulation_steps: 1
   max_steps: 10
   log_every_steps: 1
-lora: {rank: 32, alpha: 64, dropout: 0.0, expert_rank: 4}
+lora:
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  expert_rank: 4
 optimizer:
   name: adamw
   learning_rate: 0.0002
-scheduler: {name: cosine, warmup_ratio: 0.03}
+scheduler:
+  name: cosine
+  warmup_ratio: 0.03
 distributed:
   strategy: ddp
 runtime:
   backend: native
   attention: sdpa
-  model_kernels: native
+  model_kernels: auto
   loss: fused_linear_cross_entropy
-  experts: eager
+  experts: auto
   torch_compile: false
   gradient_checkpointing: true
-checkpoint: {save_every_steps: 0, save_final: true}
+  use_cache: false
+checkpoint:
+  save_every_steps: 0
+  save_final: true

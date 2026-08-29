@@ -105,6 +105,25 @@ def _load_native(
             revision,
             config.model.cache_dir,
         )
+        if cached_snapshot is not None:
+            snap = Path(cached_snapshot)
+            has_weights = any(snap.glob("model*.safetensors")) or (snap / "pytorch_model.bin").exists() or (snap / "model.safetensors").exists()
+            if not has_weights:
+                import os
+                toolkit_weights = os.environ.get("TOOLKIT_WEIGHTS", "/projects/data/llmteam/sidharth/toolkit/weights")
+                for cand in [Path(toolkit_weights) / "Qwen3-8B", Path(toolkit_weights) / spec.repo_id.split("/")[-1]]:
+                    if cand.exists() and any(cand.glob("model*.safetensors")):
+                        cached_snapshot = str(cand)
+                        break
+                else:
+                    cached_snapshot = None
+        else:
+            import os
+            toolkit_weights = os.environ.get("TOOLKIT_WEIGHTS", "/projects/data/llmteam/sidharth/toolkit/weights")
+            for cand in [Path(toolkit_weights) / spec.repo_id.split("/")[-1]]:
+                if cand.exists() and any(cand.glob("model*.safetensors")):
+                    cached_snapshot = str(cand)
+                    break
         model_source = cached_snapshot or spec.repo_id
         tokenizer_kwargs: dict[str, Any] = {
             "revision": revision,
@@ -236,8 +255,16 @@ def load_runtime(
     else:
         model, tokenizer = _load_native(config, spec, context, revision, attention)
         if model_kernels == "auto":
-            model_kernels = "native"
-        if model_kernels == "liger":
+            liger_supported = spec.key.startswith("qwen3-") or spec.key.startswith("gemma4-") or spec.key in ("deepseek-r1-distill-llama-8b", "olmo3-32b-think-dpo")
+            if liger_supported and importlib.util.find_spec("liger_kernel") is not None:
+                try:
+                    _apply_liger_kernels(model, spec)
+                    model_kernels = "liger"
+                except Exception:
+                    model_kernels = "native"
+            else:
+                model_kernels = "native"
+        elif model_kernels == "liger":
             _apply_liger_kernels(model, spec)
 
     cast(Any, model).config.use_cache = config.runtime.use_cache
@@ -257,20 +284,72 @@ def load_runtime(
         model_kernels=model_kernels,
     )
 
+def _maybe_compile_grouped_moe(model: nn.Module, mode: str) -> None:
+    try:
+        import finetune_library.lora as lora_mod
+        orig = getattr(lora_mod, "_grouped_linear", None)
+        if orig is not None and not getattr(orig, "_is_compiled", False):
+            try:
+                compiled = torch.compile(orig, mode=mode, dynamic=False, fullgraph=False)
+                compiled._is_compiled = True  # type: ignore[attr-defined]
+                lora_mod._grouped_linear = compiled  # type: ignore[assignment]
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def maybe_compile(model: nn.Module, config: ExperimentConfig) -> nn.Module:
     if not config.runtime.torch_compile:
         return model
+    # Liger kernels use custom Triton ops that currently hang inductor's
+    # cudagraph/block capture on H100 (swiglu tiling warning). For hard wins
+    # we keep liger without inductor; compile path is reserved for native.
+    try:
+        is_liger = False
+        # Detect via model_kernels attribute or liger-patched modules
+        for m in model.modules():
+            if m.__class__.__name__ in ("LigerRMSNorm", "LigerSwiGLUMLP", "LigerGEGLUMLP"):
+                is_liger = True
+                break
+        if is_liger:
+            return model
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+        torch.backends.cudnn.allow_tf32 = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        import torch._inductor.config as inductor_config  # type: ignore[import-untyped]
+        inductor_config.triton.cudagraphs = True
+        inductor_config.coordinate_descent_tuning = True
+        inductor_config.epilogue_fusion = True
+        inductor_config.triton.unique_kernel_names = True
+        inductor_config.fx_graph_cache = True
+        inductor_config.triton.max_tiles = 2
+        inductor_config.benchmark_kernel = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        torch._dynamo.config.suppress_errors = False  # type: ignore[attr-defined]
+        torch._dynamo.config.cache_size_limit = 64  # type: ignore[attr-defined]
+    except Exception:
+        pass
     scope = getattr(config.runtime, "compile_scope", "full")
     if scope == "loss_only":
-        # Compile only the loss head: find lm_head and compile it
         if hasattr(model, "lm_head"):
             try:
-                model.lm_head = torch.compile(model.lm_head, mode=config.runtime.compile_mode, dynamic=False)
+                model.lm_head = torch.compile(model.lm_head, mode=config.runtime.compile_mode, dynamic=False, fullgraph=True)
             except Exception:
                 pass
         return model
     if scope == "blocks":
-        # Compile each decoder block individually
         blocks = None
         for attr in ("model", "language_model", "model.layers", "layers"):
             try:
@@ -282,7 +361,6 @@ def maybe_compile(model: nn.Module, config: ExperimentConfig) -> nn.Module:
                     break
             except Exception:
                 continue
-        # Fallback: search for ModuleList with many identical layers
         if blocks is None:
             for mod in model.modules():
                 if isinstance(mod, torch.nn.ModuleList) and len(mod) > 4:
@@ -291,11 +369,14 @@ def maybe_compile(model: nn.Module, config: ExperimentConfig) -> nn.Module:
         if blocks is not None:
             for i, block in enumerate(blocks):
                 try:
-                    blocks[i] = torch.compile(block, mode=config.runtime.compile_mode, dynamic=False)
+                    blocks[i] = torch.compile(block, mode=config.runtime.compile_mode, dynamic=False, fullgraph=False)
                 except Exception:
                     pass
+        _maybe_compile_grouped_moe(model, config.runtime.compile_mode)
         return model
-    return cast(
+    compiled = cast(
         nn.Module,
-        torch.compile(model, mode=config.runtime.compile_mode, dynamic=False),
+        torch.compile(model, mode=config.runtime.compile_mode, dynamic=False, fullgraph=False),
     )
+    _maybe_compile_grouped_moe(compiled, config.runtime.compile_mode)
+    return compiled

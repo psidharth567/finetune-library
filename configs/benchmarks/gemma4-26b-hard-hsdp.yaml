@@ -11,9 +11,9 @@ data:
   packing: true
   drop_remainder: true
 training:
-  output_dir: outputs/benchmark-gemma4-26b-grouped-ddp
+  output_dir: outputs/benchmark-gemma4-26b-hard-hsdp
   max_seq_length: 2048
-  per_device_batch_size: 1
+  per_device_batch_size: 2
   gradient_accumulation_steps: 1
   max_steps: 60
   log_every_steps: 10
@@ -31,15 +31,19 @@ scheduler:
   name: cosine
   warmup_ratio: 0.03
 distributed:
-  strategy: ddp
+  strategy: hsdp
+  shard_size: 2
+  replicate_size: 4
 runtime:
   backend: native
   attention: sdpa
-  model_kernels: native
-  loss: cross_entropy
+  model_kernels: liger
+  loss: fused_linear_cross_entropy
   experts: grouped_mm
-  torch_compile: false
-  gradient_checkpointing: true
+  torch_compile: true
+  compile_mode: reduce-overhead
+  compile_scope: blocks
+  gradient_checkpointing: false
 checkpoint:
   save_every_steps: 0
   save_final: false

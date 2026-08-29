@@ -7,18 +7,18 @@ data:
   format: text
   path: data/cpt_train_longest_20k/train_packed_2048.jsonl
   cache_dir: .cache/benchmark-prepared
-  max_samples: 512
+  max_samples: 64
   packing: true
   drop_remainder: true
 training:
-  output_dir: outputs/benchmark-gemma4-26b-grouped-ddp
+  output_dir: outputs/benchmark-gemma4-26b-fused-ckpt
   max_seq_length: 2048
   per_device_batch_size: 1
   gradient_accumulation_steps: 1
-  max_steps: 60
-  log_every_steps: 10
-  benchmark_warmup_steps: 10
-  benchmark_steps: 50
+  max_steps: 15
+  log_every_steps: 5
+  benchmark_warmup_steps: 5
+  benchmark_steps: 10
 lora:
   rank: 32
   alpha: 64
@@ -36,7 +36,7 @@ runtime:
   backend: native
   attention: sdpa
   model_kernels: native
-  loss: cross_entropy
+  loss: fused_linear_cross_entropy
   experts: grouped_mm
   torch_compile: false
   gradient_checkpointing: true

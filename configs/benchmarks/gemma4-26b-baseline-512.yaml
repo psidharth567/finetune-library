@@ -11,12 +11,12 @@ data:
   packing: true
   drop_remainder: true
 training:
-  output_dir: outputs/benchmark-gemma4-26b-grouped-ddp
+  output_dir: outputs/benchmark-gemma4-26b-baseline-512
   max_seq_length: 2048
   per_device_batch_size: 1
   gradient_accumulation_steps: 1
   max_steps: 60
-  log_every_steps: 10
+  log_every_steps: 5
   benchmark_warmup_steps: 10
   benchmark_steps: 50
 lora:

@@ -23,14 +23,20 @@ lora:
 optimizer:
   name: adamw
   learning_rate: 0.0002
-scheduler: {name: cosine, warmup_ratio: 0.03}
-distributed: {strategy: ddp}
+scheduler:
+  name: cosine
+  warmup_ratio: 0.03
+distributed:
+  strategy: ddp
 runtime:
   backend: native
   attention: sdpa
-  model_kernels: native
-  loss: cross_entropy
+  model_kernels: auto
+  loss: fused_linear_cross_entropy
   experts: grouped_mm
   torch_compile: false
-  gradient_checkpointing: true
-checkpoint: {save_every_steps: 0, save_final: true}
+  gradient_checkpointing: false
+  use_cache: false
+checkpoint:
+  save_every_steps: 0
+  save_final: true

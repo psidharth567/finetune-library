@@ -39,8 +39,16 @@ class _FusedLoraLinearCrossEntropy(torch.autograd.Function):
         vocab_size = base_weight.shape[0]
         block_size = min(MAX_FUSED_SIZE, triton.next_power_of_2(vocab_size))
         increase_factor = triton.cdiv(vocab_size, hidden_size)
-        chunk_size = triton.next_power_of_2(triton.cdiv(tokens, increase_factor))
+        computed_chunk = triton.next_power_of_2(triton.cdiv(tokens, increase_factor))
+        preferred = 512 if tokens >= 512 else computed_chunk
+        chunk_size = max(computed_chunk, min(preferred, tokens))
+        max_bytes = 256 * 1024 * 1024
+        max_chunk_by_mem = max(1, max_bytes // (vocab_size * 2))
+        if chunk_size > max_chunk_by_mem:
+            chunk_size = max(64, triton.next_power_of_2(max_chunk_by_mem) // 2)
         chunks = triton.cdiv(tokens, chunk_size)
+        if chunks == 0:
+            chunks = 1
 
         grad_hidden = torch.zeros_like(hidden_states)
         grad_a = torch.zeros_like(lora_a, dtype=torch.float32)

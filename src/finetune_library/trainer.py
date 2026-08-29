@@ -250,8 +250,21 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
             )
 
         training_model = build_training_model(peft_model, config.runtime.loss)
-        model = wrap_model(training_model, context, spec, config.distributed)
-        model = maybe_compile(model, config)
+        # For FSDP/HSDP, compile before sharding to avoid Dynamo tracing
+        # FSDP's fully_shard hooks (HSDP hang). DDP can compile after wrap.
+        is_sharded = context.strategy in (context.strategy.HSDP, context.strategy.FSDP) if hasattr(context.strategy, "HSDP") else str(context.strategy) in ("hsdp", "fsdp")
+        # Use string check for robustness
+        try:
+            strat = str(context.strategy)
+            is_sharded = strat in ("hsdp", "fsdp", "DistributedStrategy.HSDP", "DistributedStrategy.FSDP")
+        except Exception:
+            is_sharded = False
+        if is_sharded and config.runtime.torch_compile:
+            training_model = maybe_compile(training_model, config)
+            model = wrap_model(training_model, context, spec, config.distributed)
+        else:
+            model = wrap_model(training_model, context, spec, config.distributed)
+            model = maybe_compile(model, config)
         tracking.watch(model)
         optimizer = build_optimizer(model, config.optimizer, effective_lr=config.effective_learning_rate())
 
