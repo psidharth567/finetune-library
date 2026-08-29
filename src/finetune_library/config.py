@@ -73,11 +73,28 @@ class DataConfig(StrictModel):
     drop_remainder: bool = True
     add_bos: bool = False
     add_eos: bool = True
+    packing_isolation: Literal["none", "attention"] = "none"
+    chunk_long_examples: bool = False
+    chunk_overlap: int = Field(default=0, ge=0)
+    chunk_strategy: Literal["truncate", "sliding_window"] = "truncate"
+    require_full_seq_length: bool = False
+    length_policy: Literal["global", "per_example", "per_dataset"] = "global"
+    default_max_length: PositiveInt | None = None
 
     @model_validator(mode="after")
     def validate_source(self) -> DataConfig:
         if (self.path is None) == (self.dataset_name is None):
             raise ValueError("exactly one of data.path or data.dataset_name must be set")
+        return self
+
+    @model_validator(mode="after")
+    def validate_packing(self) -> DataConfig:
+        if self.packing_isolation != "none" and not self.packing:
+            raise ValueError("data.packing_isolation requires data.packing=true")
+        if self.chunk_overlap and not self.chunk_long_examples:
+            raise ValueError("data.chunk_overlap requires data.chunk_long_examples=true")
+        if self.chunk_overlap and self.chunk_strategy != "sliding_window":
+            raise ValueError("data.chunk_overlap requires data.chunk_strategy=sliding_window")
         return self
 
 
@@ -96,7 +113,7 @@ class LoraSettings(StrictModel):
 
 class OptimizerConfig(StrictModel):
     name: OptimizerName = OptimizerName.ADAMW
-    learning_rate: Annotated[float, Field(gt=0.0)] = 2.0e-4
+    learning_rate: Annotated[float, Field(gt=0.0)] | None = None
     weight_decay: Annotated[float, Field(ge=0.0)] = 0.01
     beta1: Annotated[float, Field(gt=0.0, lt=1.0)] = 0.9
     beta2: Annotated[float, Field(gt=0.0, lt=1.0)] = 0.999
@@ -149,6 +166,7 @@ class RuntimeConfig(StrictModel):
     experts: Literal["auto", "eager", "grouped_mm"] = "auto"
     torch_compile: bool = False
     compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "default"
+    compile_scope: Literal["full", "loss_only", "blocks"] = "full"
     gradient_checkpointing: bool = True
     use_cache: bool = False
     verbose_lora_audit: bool = False
@@ -227,7 +245,22 @@ class ExperimentConfig(StrictModel):
             raise ValueError(
                 f"data.format={self.data.format.value!r} is invalid for task={self.task.value!r}"
             )
+        if self.data.default_max_length is not None and self.data.length_policy == "global":
+            raise ValueError("data.default_max_length requires length_policy != global")
         return self
+
+    def effective_learning_rate(self) -> float:
+        if self.optimizer.learning_rate is not None:
+            return self.optimizer.learning_rate
+        from finetune_library.registry import resolve_model
+
+        spec = resolve_model(self.model.name)
+        return spec.recommended_lr_cpt if self.task == Task.CPT else spec.recommended_lr_sft
+
+    def resolved_optimizer_config(self) -> OptimizerConfig:
+        if self.optimizer.learning_rate is not None:
+            return self.optimizer
+        return self.optimizer.model_copy(update={"learning_rate": self.effective_learning_rate()})
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> ExperimentConfig:

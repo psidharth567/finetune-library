@@ -159,7 +159,7 @@ def _make_loader(
         batch_size=config.training.per_device_batch_size,
         sampler=sampler,
         shuffle=shuffle,
-        collate_fn=CausalCollator(tokenizer, config.training.max_seq_length),
+        collate_fn=CausalCollator(tokenizer, config.training.max_seq_length, packing_isolation=config.data.packing_isolation),
         num_workers=workers,
         pin_memory=context.device.type == "cuda",
         persistent_workers=workers > 0,
@@ -253,7 +253,7 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
         model = wrap_model(training_model, context, spec, config.distributed)
         model = maybe_compile(model, config)
         tracking.watch(model)
-        optimizer = build_optimizer(model, config.optimizer)
+        optimizer = build_optimizer(model, config.optimizer, effective_lr=config.effective_learning_rate())
 
         dataset = _prepare_dataset(config, runtime.tokenizer, context)
         loader, sampler = _make_loader(config, runtime.tokenizer, dataset, context)

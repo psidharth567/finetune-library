@@ -46,6 +46,8 @@ def scaffold_project_config(
     resolved_format = str(data_format or _default_data_format(task))
     runtime_backend = _default_runtime_backend(model_name)
 
+    spec = resolve_model(model_name)
+    lr = spec.recommended_lr_cpt if task == Task.CPT else spec.recommended_lr_sft
     config: dict[str, Any] = {
         "version": 1,
         "task": task.value,
@@ -59,6 +61,12 @@ def scaffold_project_config(
             "cache_dir": str(cache_dir),
             "packing": task == Task.CPT,
             "drop_remainder": False,
+            "packing_isolation": "none",
+            "chunk_long_examples": False,
+            "chunk_overlap": 0,
+            "chunk_strategy": "truncate",
+            "require_full_seq_length": False,
+            "length_policy": "global",
         },
         "training": {
             "output_dir": str(output_dir),
@@ -71,7 +79,7 @@ def scaffold_project_config(
         "lora": {"rank": 32, "alpha": 64, "dropout": 0.0, "expert_rank": 4},
         "optimizer": {
             "name": "adamw",
-            "learning_rate": 0.0002,
+            "learning_rate": lr,
             "weight_decay": 0.01,
         },
         "scheduler": {"name": "cosine", "warmup_ratio": 0.03},

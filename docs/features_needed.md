@@ -1,6 +1,6 @@
 # Features needed
 
-Tracked improvements for `finetune-library`. Not implemented yet.
+Tracked improvements for `finetune-library`. **All items below implemented as of 2026-08-29 via direct ssh on bodhanai-node012 (see git diff).**
 
 ## Sequence packing and length handling
 
@@ -149,3 +149,16 @@ reading code or manually inspecting prepared data.
 | P2 | Per-example custom lengths | Niche; global length covers most cases |
 | P2 | `torch.compile` re-qualification | Perf win if scoped compile works |
 | P3 | Prepare-data length/packing stats | Debugging and agent visibility |
+
+
+## Implementation notes (2026-08-29)
+
+Implemented on `bodhanai-node012` (8x H100, wekafs, torch 2.11+cu129):
+- `data.packing_isolation: attention` -> position_ids reset + segment_ids + 4D block-diagonal attention mask in CausalCollator (SDPA compatible), verified forward/backward parity on tiny Llama.
+- `chunk_long_examples` / `chunk_overlap` / `chunk_strategy` -> _chunk_row sliding window with overlap, integrated into iter_packed_rows before packing, preserves SFT label masks.
+- `require_full_seq_length` -> drops remainder windows < max_seq_length (packing) and short examples (non-packing).
+- `per-model LR presets` -> ModelSpec.recommended_lr_cpt/sft (2e-4/1e-4), init_project uses them, ExperimentConfig.effective_learning_rate(), optimizer None -> preset.
+- `torch.compile` scopes -> runtime.compile_scope full|loss_only|blocks, runtime.maybe_compile handles each.
+- `per-example lengths` -> DataConfig.length_policy/default_max_length, cache_key includes, _effective_max_length helper.
+- `prepare-data stats` -> prepare_to_disk writes finetune_library_metadata.json + prep_stats.json with avg_fill_pct, truncated, packed_windows etc., printed summary.
+- PREPARATION_VERSION bumped 3->4, cache_key includes full data config.

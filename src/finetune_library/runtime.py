@@ -260,6 +260,41 @@ def load_runtime(
 def maybe_compile(model: nn.Module, config: ExperimentConfig) -> nn.Module:
     if not config.runtime.torch_compile:
         return model
+    scope = getattr(config.runtime, "compile_scope", "full")
+    if scope == "loss_only":
+        # Compile only the loss head: find lm_head and compile it
+        if hasattr(model, "lm_head"):
+            try:
+                model.lm_head = torch.compile(model.lm_head, mode=config.runtime.compile_mode, dynamic=False)
+            except Exception:
+                pass
+        return model
+    if scope == "blocks":
+        # Compile each decoder block individually
+        blocks = None
+        for attr in ("model", "language_model", "model.layers", "layers"):
+            try:
+                candidate = model
+                for part in attr.split("."):
+                    candidate = getattr(candidate, part)
+                if isinstance(candidate, torch.nn.ModuleList):
+                    blocks = candidate
+                    break
+            except Exception:
+                continue
+        # Fallback: search for ModuleList with many identical layers
+        if blocks is None:
+            for mod in model.modules():
+                if isinstance(mod, torch.nn.ModuleList) and len(mod) > 4:
+                    blocks = mod
+                    break
+        if blocks is not None:
+            for i, block in enumerate(blocks):
+                try:
+                    blocks[i] = torch.compile(block, mode=config.runtime.compile_mode, dynamic=False)
+                except Exception:
+                    pass
+        return model
     return cast(
         nn.Module,
         torch.compile(model, mode=config.runtime.compile_mode, dynamic=False),

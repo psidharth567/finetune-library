@@ -28,6 +28,8 @@ class ModelSpec:
     preferred_strategy: DistributedStrategy
     shard_size: int = 1
     replicate_size: int = 8
+    recommended_lr_cpt: float = 2.0e-4
+    recommended_lr_sft: float = 1.0e-4
     # PyTorch SDPA is the measured winner on H100 at sequence length 2048.
     # Keep the binary FlashAttention wheel available for explicit benchmarks.
     attention_candidates: tuple[str, ...] = ("sdpa", "flash_attention_2")

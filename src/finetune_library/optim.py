@@ -24,12 +24,15 @@ def _can_use_fused_adamw(parameters: list[nn.Parameter], requested: bool) -> boo
     )
 
 
-def build_optimizer(model: nn.Module, config: OptimizerConfig) -> torch.optim.Optimizer:
+def build_optimizer(model: nn.Module, config: OptimizerConfig, effective_lr: float | None = None) -> torch.optim.Optimizer:
     """Build an unmodified, standard optimizer over the BF16 LoRA parameters."""
 
     parameters = _trainable_parameters(model)
+    lr = config.learning_rate if config.learning_rate is not None else effective_lr
+    if lr is None:
+        raise ValueError("learning_rate must be set either in config or via effective_lr")
     common: dict[str, Any] = {
-        "lr": config.learning_rate,
+        "lr": lr,
         "betas": (config.beta1, config.beta2),
         "eps": config.epsilon,
         "weight_decay": config.weight_decay,
