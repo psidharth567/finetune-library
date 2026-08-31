@@ -379,7 +379,7 @@ def expert_parallel_forward_deepep(
         token_indices,
         recv_hidden.shape[0],
     )
-    combined = _DeepEPCombine.apply(per_token_output, buffer, handle)
+    combined = _DeepEPCombine.apply(per_token_output.to(torch.bfloat16), buffer, handle)
     return combined.to(hidden_states.dtype)
 
 
