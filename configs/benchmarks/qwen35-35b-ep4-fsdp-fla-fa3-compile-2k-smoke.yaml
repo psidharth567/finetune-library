@@ -11,7 +11,7 @@ data:
   packing: true
   drop_remainder: true
 training:
-  output_dir: outputs/smoke-qwen35-35b-ep-fsdp-fla-fa3-deepep-2k-r32
+  output_dir: outputs/smoke-qwen35-35b-ep-fsdp-fla-fa3-compile-2k-r32
   max_seq_length: 2048
   per_device_batch_size: 1
   gradient_accumulation_steps: 1
@@ -38,8 +38,10 @@ runtime:
   model_kernels: native
   loss: fused_linear_cross_entropy
   experts: grouped_mm
-  moe_a2a_backend: deepep
-  torch_compile: false
+  moe_a2a_backend: native
+  torch_compile: true
+  compile_mode: reduce-overhead
+  compile_scope: blocks
   gradient_checkpointing: true
   use_cache: false
 checkpoint:
