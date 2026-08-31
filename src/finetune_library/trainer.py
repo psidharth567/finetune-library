@@ -403,6 +403,11 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                             dtype=torch.bfloat16,
                             enabled=context.device.type == "cuda",
                         ):
+                            if config.runtime.torch_compile and context.device.type == "cuda":
+                                try:
+                                    torch.compiler.cudagraph_mark_step_begin()
+                                except Exception:
+                                    pass
                             output = model(
                                 **batch,
                                 use_cache=False,
