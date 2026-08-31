@@ -498,6 +498,11 @@ def inject_lora(
     if spec.moe:
         if expert_implementation == "auto":
             expert_implementation = "eager"
+        if moe_layout is not None and moe_layout.enabled and expert_implementation != "grouped_mm":
+            raise ValueError(
+                "expert_parallel_size > 1 requires runtime.experts=grouped_mm; "
+                f"got {expert_implementation!r}"
+            )
         installed = _install_active_expert_forward(peft_model, expert_implementation, moe_layout)
         expected = sum(
             1 for module in model.modules() if module.__class__.__name__ in EXPERT_LAYER_NAMES

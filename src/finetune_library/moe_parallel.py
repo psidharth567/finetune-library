@@ -71,6 +71,23 @@ class MoeParallelLayout:
         return self.expert_parallel_size > 1
 
 
+def _all_to_all_exchange(
+    tensor: torch.Tensor,
+    *,
+    perm: torch.Tensor,
+    input_split_sizes: list[int],
+    recv_sizes: list[int],
+    ep_group: Any,
+) -> torch.Tensor:
+    ordered = tensor[perm]
+    split_tensors = list(torch.split(ordered, input_split_sizes, dim=0))
+    trailing = tuple(tensor.shape[1:])
+    recv_buffers = [tensor.new_zeros((size, *trailing)) for size in recv_sizes]
+    if split_tensors:
+        dist.all_to_all(recv_buffers, split_tensors, group=ep_group)
+    return torch.cat(recv_buffers, dim=0) if recv_buffers else tensor.new_zeros((0, *trailing))
+
+
 class _AllToAllTokens(Function):
     @staticmethod
     def forward(
@@ -92,17 +109,34 @@ class _AllToAllTokens(Function):
         dist.all_to_all_single(output_splits, input_splits, group=ep_group)
         recv_sizes = output_splits.tolist()
 
-        def _exchange(tensor: torch.Tensor) -> torch.Tensor:
-            split_tensors = list(torch.split(tensor[perm], input_split_sizes))
-            recv_buffers = [tensor.new_zeros(size) for size in recv_sizes]
-            if split_tensors:
-                dist.all_to_all(recv_buffers, split_tensors, group=ep_group)
-            return torch.cat(recv_buffers, dim=0) if recv_buffers else tensor.new_zeros(0)
-
-        recv_hidden = _exchange(hidden_states[token_ids])
-        recv_expert_ids = _exchange(expert_ids)
-        recv_weights = _exchange(weights)
-        recv_token_ids = _exchange(token_ids)
+        recv_hidden = _all_to_all_exchange(
+            hidden_states[token_ids],
+            perm=perm,
+            input_split_sizes=input_split_sizes,
+            recv_sizes=recv_sizes,
+            ep_group=ep_group,
+        )
+        recv_expert_ids = _all_to_all_exchange(
+            expert_ids,
+            perm=perm,
+            input_split_sizes=input_split_sizes,
+            recv_sizes=recv_sizes,
+            ep_group=ep_group,
+        )
+        recv_weights = _all_to_all_exchange(
+            weights,
+            perm=perm,
+            input_split_sizes=input_split_sizes,
+            recv_sizes=recv_sizes,
+            ep_group=ep_group,
+        )
+        recv_token_ids = _all_to_all_exchange(
+            token_ids,
+            perm=perm,
+            input_split_sizes=input_split_sizes,
+            recv_sizes=recv_sizes,
+            ep_group=ep_group,
+        )
 
         ctx.ep_group = ep_group
         ctx.input_split_sizes = input_split_sizes
@@ -111,6 +145,7 @@ class _AllToAllTokens(Function):
         ctx.token_ids = token_ids
         ctx.weights = weights
         ctx.hidden_dim = hidden_states.shape[-1]
+        ctx.num_tokens = hidden_states.shape[0]
         return (
             recv_hidden,
             recv_expert_ids,
@@ -123,15 +158,15 @@ class _AllToAllTokens(Function):
 
     @staticmethod
     def backward(ctx: Any, grad_hidden: torch.Tensor, *_: Any) -> tuple[torch.Tensor | None, ...]:
-        split_grad = list(torch.split(grad_hidden, ctx.recv_sizes))
+        split_grad = list(torch.split(grad_hidden, ctx.recv_sizes, dim=0))
         recv_grad = [
-            grad_hidden.new_zeros(size, ctx.hidden_dim) for size in ctx.input_split_sizes
+            grad_hidden.new_zeros((size, ctx.hidden_dim)) for size in ctx.input_split_sizes
         ]
         if split_grad:
             dist.all_to_all(recv_grad, split_grad, group=ctx.ep_group)
         sorted_grad = torch.cat(recv_grad, dim=0) if recv_grad else grad_hidden.new_zeros(0, ctx.hidden_dim)
-        grad_out = grad_hidden.new_zeros(ctx.token_ids.shape[0], ctx.hidden_dim)
-        grad_out[ctx.token_ids[ctx.perm]] = sorted_grad
+        grad_out = grad_hidden.new_zeros(ctx.num_tokens, ctx.hidden_dim)
+        grad_out.index_add_(0, ctx.token_ids[ctx.perm], sorted_grad)
         return grad_out, None, None, None, None, None, None
 
 
@@ -150,7 +185,7 @@ class _CombineExpertOutputs(Function):
         num_tokens: int,
         hidden_dim: int,
     ) -> torch.Tensor:
-        split_output = list(torch.split(expert_output, recv_sizes))
+        split_output = list(torch.split(expert_output, recv_sizes, dim=0))
         recv_output = [expert_output.new_zeros(size, hidden_dim) for size in input_split_sizes]
         dist.all_to_all(recv_output, split_output, group=ep_group)
         sorted_output = torch.cat(recv_output, dim=0) if recv_output else expert_output.new_zeros(0, hidden_dim)
@@ -169,7 +204,7 @@ class _CombineExpertOutputs(Function):
     @staticmethod
     def backward(ctx: Any, grad_final: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         sorted_grad = grad_final[ctx.token_ids[ctx.perm]]
-        split_grad = list(torch.split(sorted_grad, ctx.input_split_sizes))
+        split_grad = list(torch.split(sorted_grad, ctx.input_split_sizes, dim=0))
         recv_grad = [sorted_grad.new_zeros(size, grad_final.shape[-1]) for size in ctx.recv_sizes]
         dist.all_to_all(recv_grad, split_grad, group=ctx.ep_group)
         expert_grad = torch.cat(recv_grad, dim=0) if recv_grad else sorted_grad.new_zeros(0, grad_final.shape[-1])

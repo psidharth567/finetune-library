@@ -25,3 +25,16 @@ def test_qwen_expert_count_divisible() -> None:
     assert gemma.num_experts == 128
     assert 256 % 4 == 0
     assert 128 % 4 == 0
+
+
+def test_all_to_all_exchange_buffer_shapes() -> None:
+    import torch
+
+    hidden = torch.randn(8, 16)
+    trailing = tuple(hidden.shape[1:])
+    recv_sizes = [3, 5]
+    buffers = [hidden.new_zeros((size, *trailing)) for size in recv_sizes]
+    assert buffers[0].shape == (3, 16)
+    assert buffers[1].shape == (5, 16)
+    split = list(torch.split(hidden, [4, 4], dim=0))
+    assert split[0].shape == (4, 16)
