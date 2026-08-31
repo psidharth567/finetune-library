@@ -10,7 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from finetune_library.config import LoraSettings
-from finetune_library.moe_parallel import MoeParallelLayout, expert_parallel_forward
+from finetune_library.moe_parallel import MoeA2ABackend, MoeParallelLayout, expert_parallel_forward
 from finetune_library.registry import ModelSpec
 
 EXPERT_LAYER_NAMES = frozenset({"Gemma4TextExperts", "Qwen3_5MoeExperts"})
@@ -263,6 +263,11 @@ def _install_active_expert_forward(
                     recv_expert_ids: torch.Tensor,
                     recv_weights: torch.Tensor,
                 ) -> torch.Tensor:
+                    expert_offset = (
+                        0
+                        if moe_layout.a2a_backend == MoeA2ABackend.DEEPEP
+                        else moe_layout.global_expert_offset
+                    )
                     return _grouped_local_expert_compute(
                         base,
                         gate_wrapper,
@@ -270,7 +275,7 @@ def _install_active_expert_forward(
                         recv_hidden,
                         recv_expert_ids,
                         recv_weights,
-                        moe_layout.global_expert_offset,
+                        expert_offset,
                     )
 
                 return expert_parallel_forward(

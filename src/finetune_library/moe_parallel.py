@@ -211,6 +211,131 @@ class _CombineExpertOutputs(Function):
         return expert_grad, None, None, None, None, None, None, None, None, None
 
 
+_deepep_buffer: Any = None
+_deepep_buffer_key: tuple[int, int, int] | None = None
+
+
+def _get_deepep_buffer(ep_group: Any, hidden_dim: int, param_bytes: int = 2) -> Any:
+    global _deepep_buffer, _deepep_buffer_key
+    import deep_ep
+
+    hidden_bytes = hidden_dim * max(param_bytes, 2)
+    key = (id(ep_group), hidden_bytes, ep_group.size())
+    if _deepep_buffer is not None and _deepep_buffer_key == key:
+        return _deepep_buffer
+
+    num_nvl_bytes = 0
+    num_rdma_bytes = 0
+    for config in (
+        deep_ep.Buffer.get_dispatch_config(ep_group.size()),
+        deep_ep.Buffer.get_combine_config(ep_group.size()),
+    ):
+        num_nvl_bytes = max(
+            config.get_nvl_buffer_size_hint(hidden_bytes, ep_group.size()),
+            num_nvl_bytes,
+        )
+        num_rdma_bytes = max(
+            config.get_rdma_buffer_size_hint(hidden_bytes, ep_group.size()),
+            num_rdma_bytes,
+        )
+    _deepep_buffer = deep_ep.Buffer(ep_group, num_nvl_bytes, num_rdma_bytes)
+    _deepep_buffer_key = key
+    return _deepep_buffer
+
+
+class _DeepEPDispatch(Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        hidden_states: torch.Tensor,
+        topk_index: torch.Tensor,
+        topk_weights: torch.Tensor,
+        buffer: Any,
+        num_experts: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+        topk_ids = topk_index.to(torch.int64).contiguous()
+        weights = topk_weights.to(torch.float32).contiguous()
+        dispatch_x = hidden_states.to(torch.bfloat16).contiguous()
+        (
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            _,
+        ) = buffer.get_dispatch_layout(topk_ids, num_experts)
+        (
+            recv_hidden,
+            recv_topk_ids,
+            recv_topk_weights,
+            _,
+            handle,
+            _,
+        ) = buffer.dispatch(
+            dispatch_x,
+            topk_idx=topk_ids,
+            topk_weights=weights,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+        )
+        ctx.buffer = buffer
+        ctx.handle = handle
+        ctx.input_dtype = hidden_states.dtype
+        return recv_hidden, recv_topk_ids, recv_topk_weights, handle
+
+    @staticmethod
+    def backward(ctx: Any, grad_recv_hidden: torch.Tensor, *_: Any) -> tuple[torch.Tensor | None, ...]:
+        if grad_recv_hidden is None:
+            return None, None, None, None, None, None
+        combined_grad, _, _ = ctx.buffer.combine(
+            grad_recv_hidden.contiguous(),
+            ctx.handle,
+            async_finish=False,
+        )
+        grad_hidden = combined_grad.to(ctx.input_dtype)
+        return grad_hidden, None, None, None, None
+
+
+class _DeepEPCombine(Function):
+    @staticmethod
+    def forward(ctx: Any, expert_output: torch.Tensor, buffer: Any, handle: Any) -> torch.Tensor:
+        combined, _, _ = buffer.combine(expert_output.contiguous(), handle, async_finish=False)
+        ctx.buffer = buffer
+        ctx.handle = handle
+        return combined
+
+    @staticmethod
+    def backward(ctx: Any, grad_combined: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+        if grad_combined is None:
+            return None, None, None
+        grad_output, _, _, _, _, _ = ctx.buffer.dispatch(
+            grad_combined.contiguous(),
+            handle=ctx.handle,
+            async_finish=False,
+        )
+        return grad_output, None, None
+
+
+def expert_parallel_forward_deepep(
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    layout: MoeParallelLayout,
+    local_forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    buffer = _get_deepep_buffer(layout.ep_group, hidden_states.shape[-1])
+    recv_hidden, recv_expert_ids, recv_weights, handle = _DeepEPDispatch.apply(
+        hidden_states,
+        top_k_index,
+        top_k_weights,
+        buffer,
+        layout.num_experts,
+    )
+    local_output = local_forward(recv_hidden, recv_expert_ids, recv_weights)
+    return _DeepEPCombine.apply(local_output, buffer, handle)
+
+
 def _local_grouped_experts_forward(
     hidden_states: torch.Tensor,
     gate_up_proj: torch.Tensor,
@@ -260,6 +385,14 @@ def expert_parallel_forward(
     layout: MoeParallelLayout,
     local_forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
 ) -> torch.Tensor:
+    if layout.a2a_backend == MoeA2ABackend.DEEPEP:
+        return expert_parallel_forward_deepep(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            layout,
+            local_forward,
+        )
     num_tokens, hidden_dim = hidden_states.shape
     top_k = top_k_index.shape[-1]
     device = hidden_states.device
@@ -306,6 +439,10 @@ def _ep_experts_forward(
     top_k_weights: torch.Tensor,
     layout: MoeParallelLayout,
 ) -> torch.Tensor:
+    expert_offset = (
+        0 if layout.a2a_backend == MoeA2ABackend.DEEPEP else layout.global_expert_offset
+    )
+
     def local_forward(
         recv_hidden: torch.Tensor,
         recv_expert_ids: torch.Tensor,
@@ -318,7 +455,7 @@ def _ep_experts_forward(
             recv_expert_ids,
             recv_weights,
             module.act_fn,
-            layout.global_expert_offset,
+            expert_offset,
         )
 
     return expert_parallel_forward(
