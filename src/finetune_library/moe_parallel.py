@@ -38,16 +38,10 @@ class _AllToAllTokens(Function):
         ep_group: Any,
         ep_size: int,
         experts_per_rank: int,
-        reverse: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[int], torch.Tensor]:
         device = hidden_states.device
         dest_rank = expert_ids // experts_per_rank
         perm = torch.argsort(dest_rank)
-        sorted_hidden = hidden_states[token_ids[perm]]
-        sorted_expert_ids = expert_ids[perm]
-        sorted_weights = weights[perm]
-        sorted_token_ids = token_ids[perm]
-
         input_split_sizes = torch.bincount(dest_rank, minlength=ep_size).tolist()
         input_splits = torch.tensor(input_split_sizes, device=device, dtype=torch.long)
         output_splits = torch.zeros(ep_size, device=device, dtype=torch.long)
@@ -57,10 +51,11 @@ class _AllToAllTokens(Function):
         def _exchange(tensor: torch.Tensor) -> torch.Tensor:
             split_tensors = list(torch.split(tensor[perm], input_split_sizes))
             recv_buffers = [tensor.new_zeros(size) for size in recv_sizes]
-            dist.all_to_all(recv_buffers, split_tensors, group=ep_group)
+            if split_tensors:
+                dist.all_to_all(recv_buffers, split_tensors, group=ep_group)
             return torch.cat(recv_buffers, dim=0) if recv_buffers else tensor.new_zeros(0)
 
-        recv_hidden = _exchange(hidden_states)
+        recv_hidden = _exchange(hidden_states[token_ids])
         recv_expert_ids = _exchange(expert_ids)
         recv_weights = _exchange(weights)
         recv_token_ids = _exchange(token_ids)
@@ -71,9 +66,16 @@ class _AllToAllTokens(Function):
         ctx.perm = perm
         ctx.token_ids = token_ids
         ctx.weights = weights
-        ctx.reverse = reverse
         ctx.hidden_dim = hidden_states.shape[-1]
-        return recv_hidden, recv_expert_ids, recv_weights, recv_token_ids
+        return (
+            recv_hidden,
+            recv_expert_ids,
+            recv_weights,
+            recv_token_ids,
+            input_split_sizes,
+            recv_sizes,
+            perm,
+        )
 
     @staticmethod
     def backward(ctx: Any, grad_hidden: torch.Tensor, *_: Any) -> tuple[torch.Tensor | None, ...]:
@@ -81,11 +83,12 @@ class _AllToAllTokens(Function):
         recv_grad = [
             grad_hidden.new_zeros(size, ctx.hidden_dim) for size in ctx.input_split_sizes
         ]
-        dist.all_to_all(recv_grad, split_grad, group=ctx.ep_group)
+        if split_grad:
+            dist.all_to_all(recv_grad, split_grad, group=ctx.ep_group)
         sorted_grad = torch.cat(recv_grad, dim=0) if recv_grad else grad_hidden.new_zeros(0, ctx.hidden_dim)
         grad_out = grad_hidden.new_zeros(ctx.token_ids.shape[0], ctx.hidden_dim)
         grad_out[ctx.token_ids[ctx.perm]] = sorted_grad
-        return grad_out, None, None, None, None, None, None, None
+        return grad_out, None, None, None, None, None, None
 
 
 class _CombineExpertOutputs(Function):
@@ -140,6 +143,12 @@ def _local_grouped_experts_forward(
     if hidden_states.numel() == 0:
         return hidden_states
     local_expert_ids = expert_ids - global_offset
+    if torch.any(local_expert_ids < 0) or torch.any(local_expert_ids >= gate_up_proj.shape[0]):
+        raise RuntimeError(
+            "received expert ids outside the local shard: "
+            f"min={int(local_expert_ids.min())} max={int(local_expert_ids.max())} "
+            f"local={gate_up_proj.shape[0]}"
+        )
     permutation = torch.argsort(local_expert_ids)
     inverse = torch.empty_like(permutation)
     inverse[permutation] = torch.arange(permutation.numel(), device=hidden_states.device)
@@ -177,24 +186,23 @@ def expert_parallel_forward(
     expert_ids = top_k_index.reshape(-1)
     token_ids = torch.arange(num_tokens, device=device).repeat_interleave(top_k)
     weights = top_k_weights.reshape(-1)
-    experts_per_rank = layout.local_num_experts
-    dest_rank = expert_ids // experts_per_rank
-    perm = torch.argsort(dest_rank)
-    input_split_sizes = torch.bincount(dest_rank, minlength=layout.expert_parallel_size).tolist()
-    input_splits = torch.tensor(input_split_sizes, device=device, dtype=torch.long)
-    output_splits = torch.zeros(layout.expert_parallel_size, device=device, dtype=torch.long)
-    dist.all_to_all_single(output_splits, input_splits, group=layout.ep_group)
-    recv_sizes = output_splits.tolist()
 
-    recv_hidden, recv_expert_ids, recv_weights, recv_token_ids = _AllToAllTokens.apply(
+    (
+        recv_hidden,
+        recv_expert_ids,
+        recv_weights,
+        recv_token_ids,
+        input_split_sizes,
+        recv_sizes,
+        perm,
+    ) = _AllToAllTokens.apply(
         hidden_states,
         expert_ids,
         token_ids,
         weights,
         layout.ep_group,
         layout.expert_parallel_size,
-        experts_per_rank,
-        False,
+        layout.local_num_experts,
     )
     local_output = local_forward(recv_hidden, recv_expert_ids, recv_weights)
     return _CombineExpertOutputs.apply(
