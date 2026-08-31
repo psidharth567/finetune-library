@@ -154,9 +154,10 @@ class _CombineExpertOutputs(Function):
         recv_output = [expert_output.new_zeros(size, hidden_dim) for size in input_split_sizes]
         dist.all_to_all(recv_output, split_output, group=ep_group)
         sorted_output = torch.cat(recv_output, dim=0) if recv_output else expert_output.new_zeros(0, hidden_dim)
-        weighted = sorted_output * weights[perm].unsqueeze(-1)
+        # Local expert kernels already apply routing weights; only route outputs
+        # back to their source tokens here.
         final = expert_output.new_zeros(num_tokens, hidden_dim)
-        final.index_add_(0, original_token_ids[perm], weighted.to(final.dtype))
+        final.index_add_(0, original_token_ids[perm], sorted_output.to(final.dtype))
         ctx.ep_group = ep_group
         ctx.input_split_sizes = input_split_sizes
         ctx.recv_sizes = recv_sizes
@@ -167,7 +168,7 @@ class _CombineExpertOutputs(Function):
 
     @staticmethod
     def backward(ctx: Any, grad_final: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
-        sorted_grad = grad_final[ctx.token_ids[ctx.perm]] * ctx.weights[ctx.perm].unsqueeze(-1)
+        sorted_grad = grad_final[ctx.token_ids[ctx.perm]]
         split_grad = list(torch.split(sorted_grad, ctx.input_split_sizes))
         recv_grad = [sorted_grad.new_zeros(size, grad_final.shape[-1]) for size in ctx.recv_sizes]
         dist.all_to_all(recv_grad, split_grad, group=ctx.ep_group)
@@ -252,7 +253,7 @@ def expert_parallel_forward(
     return _CombineExpertOutputs.apply(
         local_output,
         recv_token_ids,
-        recv_weights,
+        weights,
         layout.ep_group,
         input_split_sizes,
         recv_sizes,
