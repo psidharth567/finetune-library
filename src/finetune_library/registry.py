@@ -18,6 +18,10 @@ HSDP_4 = DistributedCandidate(DistributedStrategy.HSDP, shard_size=4, replicate_
 FSDP_8 = DistributedCandidate(DistributedStrategy.FSDP, shard_size=8, replicate_size=1)
 
 
+HSDP_EP_4 = DistributedCandidate(DistributedStrategy.HSDP, shard_size=2, replicate_size=2)
+FSDP_EP_8 = DistributedCandidate(DistributedStrategy.FSDP, shard_size=1, replicate_size=8)
+
+
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
     key: str
@@ -28,6 +32,7 @@ class ModelSpec:
     preferred_strategy: DistributedStrategy
     shard_size: int = 1
     replicate_size: int = 8
+    num_experts: int | None = None
     recommended_lr_cpt: float = 2.0e-4
     recommended_lr_sft: float = 1.0e-4
     # PyTorch SDPA is the measured winner on H100 at sequence length 2048.
@@ -102,9 +107,24 @@ _SPECS = (
         layer_class="Gemma4TextDecoderLayer",
         preferred_strategy=DistributedStrategy.DDP,
         attention_candidates=("sdpa", "eager"),
-        distributed_candidates=(DDP_8, HSDP_2, HSDP_4, FSDP_8),
+        distributed_candidates=(DDP_8, HSDP_2, HSDP_4, FSDP_8, HSDP_EP_4, FSDP_EP_8),
         text_only=True,
         moe=True,
+        num_experts=128,
+        unsloth_compatible=False,
+    ),
+    ModelSpec(
+        key="qwen3.5-35b-a3b",
+        repo_id="Qwen/Qwen3.5-35B-A3B",
+        revision="59d61f3ce65a6d9863b86d2e96597125219dc754",
+        architecture="moe",
+        layer_class="Qwen3_5MoeDecoderLayer",
+        preferred_strategy=DistributedStrategy.FSDP,
+        attention_candidates=("sdpa", "flash_attention_2", "eager"),
+        distributed_candidates=(FSDP_8, HSDP_2, HSDP_4, HSDP_EP_4, FSDP_EP_8),
+        text_only=True,
+        moe=True,
+        num_experts=256,
         unsloth_compatible=False,
     ),
     ModelSpec(

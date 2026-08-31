@@ -12,6 +12,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from finetune_library.config import DistributedConfig, DistributedStrategy
+from finetune_library.moe_parallel import MoeParallelLayout
 from finetune_library.registry import ModelSpec
 
 
@@ -24,10 +25,13 @@ class DistributedContext:
     strategy: DistributedStrategy
     shard_size: int
     replicate_size: int
+    expert_parallel_size: int
     data_parallel_rank: int
     data_parallel_size: int
     data_parallel_group: Any = None
     mesh: Any = None
+    dense_mesh: Any = None
+    moe_layout: MoeParallelLayout | None = None
     initialized_here: bool = False
     replicated_trainables: tuple[nn.Parameter, ...] = ()
 
@@ -133,6 +137,9 @@ def initialize_distributed(
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     initialized_here = False
+    expert_parallel_size = config.expert_parallel_size
+    if expert_parallel_size > 1 and not spec.moe:
+        raise ValueError(f"{spec.key} does not support expert_parallel_size > 1")
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -165,48 +172,78 @@ def initialize_distributed(
             strategy,
             shard_size,
             replicate_size,
+            expert_parallel_size,
             data_rank,
             data_size,
             initialized_here=initialized_here,
         )
 
     mesh = None
+    dense_mesh = None
     data_group = dist.group.WORLD if world_size > 1 else None
     if strategy == DistributedStrategy.DDP:
         shard_size, replicate_size = 1, world_size
         data_rank, data_size = rank, world_size
-    elif strategy == DistributedStrategy.FSDP:
-        if world_size < 2:
-            raise ValueError("fsdp requires torchrun with at least two processes")
-        shard_size, replicate_size = world_size, 1
-        data_rank, data_size = 0, 1
+    elif strategy in {DistributedStrategy.FSDP, DistributedStrategy.HSDP}:
         from torch.distributed.device_mesh import init_device_mesh
 
-        mesh = init_device_mesh(device.type, (world_size,), mesh_dim_names=("dp_shard",))
-        data_group = None
-    elif strategy == DistributedStrategy.HSDP:
-        shard_size = config.shard_size or spec.shard_size
-        replicate_size = config.replicate_size or spec.replicate_size
-        if shard_size * replicate_size != world_size:
-            if world_size % shard_size:
-                raise ValueError(
-                    "hsdp requires world_size to be divisible by shard_size, "
-                    f"got {world_size} % {shard_size}"
+        dense_world = world_size // expert_parallel_size if expert_parallel_size > 1 else world_size
+        if expert_parallel_size > 1 and dense_world * expert_parallel_size != world_size:
+            raise ValueError(
+                "world_size must equal dense_parallel_size * expert_parallel_size, "
+                f"got {world_size} and ep={expert_parallel_size}"
+            )
+        if strategy == DistributedStrategy.FSDP:
+            if dense_world < 1:
+                raise ValueError("fsdp requires at least one dense parallel rank")
+            if dense_world == 1 and expert_parallel_size == 1 and world_size < 2:
+                raise ValueError("fsdp requires torchrun with at least two processes")
+            shard_size, replicate_size = dense_world, 1
+            if expert_parallel_size > 1:
+                mesh = init_device_mesh(
+                    device.type,
+                    (dense_world, expert_parallel_size),
+                    mesh_dim_names=("dp_shard", "ep"),
                 )
-            # Preserve the benchmarked intra-node shard degree and scale only
-            # the data-parallel replicas when moving from 8 to 16 GPUs.
-            replicate_size = world_size // shard_size
-        if shard_size > 8:
-            raise ValueError("HSDP shard groups must remain within one 8-GPU NVSwitch node")
-        from torch.distributed.device_mesh import init_device_mesh
-
-        mesh = init_device_mesh(
-            device.type,
-            (replicate_size, shard_size),
-            mesh_dim_names=("dp_replicate", "dp_shard"),
-        )
-        data_group = mesh["dp_replicate"].get_group()
-        data_rank, data_size = rank // shard_size, replicate_size
+                dense_mesh = mesh["dp_shard"]
+                data_group = None
+                data_rank, data_size = 0, 1
+            else:
+                mesh = init_device_mesh(device.type, (dense_world,), mesh_dim_names=("dp_shard",))
+                dense_mesh = mesh
+                data_group = None
+                data_rank, data_size = 0, 1
+        else:
+            shard_size = config.shard_size or spec.shard_size
+            replicate_size = config.replicate_size or spec.replicate_size
+            if shard_size * replicate_size != dense_world:
+                if dense_world % shard_size:
+                    raise ValueError(
+                        "hsdp requires dense_world_size to be divisible by shard_size, "
+                        f"got {dense_world} % {shard_size}"
+                    )
+                replicate_size = dense_world // shard_size
+            if shard_size > 8:
+                raise ValueError("HSDP shard groups must remain within one 8-GPU NVSwitch node")
+            if expert_parallel_size > 1:
+                mesh = init_device_mesh(
+                    device.type,
+                    (replicate_size, shard_size, expert_parallel_size),
+                    mesh_dim_names=("dp_replicate", "dp_shard", "ep"),
+                )
+                dense_mesh = mesh["dp_replicate", "dp_shard"]
+                data_group = mesh["dp_replicate"].get_group()
+                data_rank = mesh.get_coordinate()[0]
+                data_size = replicate_size
+            else:
+                mesh = init_device_mesh(
+                    device.type,
+                    (replicate_size, shard_size),
+                    mesh_dim_names=("dp_replicate", "dp_shard"),
+                )
+                dense_mesh = mesh
+                data_group = mesh["dp_replicate"].get_group()
+                data_rank, data_size = rank // shard_size, replicate_size
     else:
         raise AssertionError(f"unhandled distributed strategy {strategy}")
 
@@ -218,12 +255,24 @@ def initialize_distributed(
         strategy=strategy,
         shard_size=shard_size,
         replicate_size=replicate_size,
+        expert_parallel_size=expert_parallel_size,
         data_parallel_rank=data_rank,
         data_parallel_size=data_size,
         data_parallel_group=data_group,
         mesh=mesh,
+        dense_mesh=dense_mesh,
         initialized_here=initialized_here,
     )
+
+
+def _layer_shard_units(layer: nn.Module, spec: ModelSpec) -> list[nn.Module]:
+    units: list[nn.Module] = []
+    for child in layer.children():
+        if child.__class__.__name__ == "Qwen3_5MoeSparseMoeBlock":
+            units.extend(list(child.children()))
+        else:
+            units.append(child)
+    return units or [layer]
 
 
 def wrap_model(
@@ -258,22 +307,27 @@ def wrap_model(
         for parameter in model.parameters()
         if parameter in ignored and parameter.requires_grad
     )
+    shard_mesh = context.dense_mesh or context.mesh
     layers = [module for module in model.modules() if module.__class__.__name__ == spec.layer_class]
     if not layers:
         raise RuntimeError(f"could not find transformer layers named {spec.layer_class}")
     for layer in layers:
         layer_parameters = set(layer.parameters())
         layer_ignored = ignored.intersection(layer_parameters)
-        fully_shard(
-            layer,
-            mesh=context.mesh,
-            mp_policy=policy,
-            reshard_after_forward=True,
-            ignored_params=layer_ignored or None,
-        )
+        units = _layer_shard_units(layer, spec) if spec.moe and context.expert_parallel_size > 1 else [layer]
+        for unit in units:
+            unit_parameters = set(unit.parameters())
+            unit_ignored = ignored.intersection(unit_parameters)
+            fully_shard(
+                unit,
+                mesh=shard_mesh,
+                mp_policy=policy,
+                reshard_after_forward=True,
+                ignored_params=unit_ignored or None,
+            )
     fully_shard(
         model,
-        mesh=context.mesh,
+        mesh=shard_mesh,
         mp_policy=policy,
         # Root-only embedding/head parameters remain materialized through
         # backward. This avoids a redundant all-gather and keeps fused

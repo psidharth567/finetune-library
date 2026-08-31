@@ -65,6 +65,12 @@ def _apply_liger_kernels(model: nn.Module, spec: ModelSpec) -> None:
         liger.apply_liger_kernel_to_llama(rope=True, swiglu=True, **common)
     elif spec.key == "olmo3-32b-think-dpo":
         liger.apply_liger_kernel_to_olmo3(rope=True, swiglu=True, **common)
+    elif spec.key.startswith("qwen3.5-"):
+        apply = getattr(liger, "apply_liger_kernel_to_qwen3_5", None)
+        if callable(apply):
+            apply(rope=True, swiglu=True, **common)
+        else:
+            raise ValueError(f"no Liger model-kernel profile for {spec.key}")
     elif spec.key.startswith("gemma4-"):
         liger.apply_liger_kernel_to_gemma4_text(rope=False, geglu=True, **common)
     else:
@@ -156,7 +162,7 @@ def _load_native(
             common["device_map"] = {"": context.device}
 
         model: nn.Module
-        if spec.text_only:
+        if spec.text_only and spec.key.startswith("gemma4-"):
             from transformers import Gemma4ForCausalLM
 
             root_config = AutoConfig.from_pretrained(
@@ -173,6 +179,26 @@ def _load_native(
                     model_source,
                     config=text_config,
                     key_mapping={"model.language_model.": "model."},
+                    **common,
+                ),
+            )
+            cast(Any, model).tie_weights()
+        elif spec.text_only and spec.key.startswith("qwen3.5-"):
+            from transformers import Qwen3_5MoeForCausalLM
+
+            root_config = AutoConfig.from_pretrained(
+                model_source,
+                revision=revision,
+                cache_dir=config.model.cache_dir,
+                trust_remote_code=config.model.trust_remote_code,
+            )
+            text_config = root_config.get_text_config()
+            text_config.use_cache = config.runtime.use_cache
+            model = cast(
+                nn.Module,
+                Qwen3_5MoeForCausalLM.from_pretrained(
+                    model_source,
+                    config=text_config,
                     **common,
                 ),
             )
@@ -255,7 +281,12 @@ def load_runtime(
     else:
         model, tokenizer = _load_native(config, spec, context, revision, attention)
         if model_kernels == "auto":
-            liger_supported = spec.key.startswith("qwen3-") or spec.key.startswith("gemma4-") or spec.key in ("deepseek-r1-distill-llama-8b", "olmo3-32b-think-dpo")
+            liger_supported = (
+                spec.key.startswith("qwen3-")
+                or spec.key.startswith("qwen3.5-")
+                or spec.key.startswith("gemma4-")
+                or spec.key in ("deepseek-r1-distill-llama-8b", "olmo3-32b-think-dpo")
+            )
             if liger_supported and importlib.util.find_spec("liger_kernel") is not None:
                 try:
                     _apply_liger_kernels(model, spec)

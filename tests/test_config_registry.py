@@ -33,6 +33,7 @@ def test_registry_contains_exact_production_set() -> None:
         "Qwen/Qwen3-8B",
         "Qwen/Qwen3-14B",
         "Qwen/Qwen3-32B",
+        "Qwen/Qwen3.5-35B-A3B",
         "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
         "allenai/Olmo-3-32B-Think-DPO",
         "google/gemma-4-26B-A4B-it",

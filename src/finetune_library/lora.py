@@ -10,7 +10,10 @@ from torch import nn
 from torch.nn import functional as F
 
 from finetune_library.config import LoraSettings
+from finetune_library.moe_parallel import MoeParallelLayout, expert_parallel_forward
 from finetune_library.registry import ModelSpec
+
+EXPERT_LAYER_NAMES = frozenset({"Gemma4TextExperts", "Qwen3_5MoeExperts"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,9 +151,41 @@ def _grouped_expert_delta(
     return _grouped_linear(after_a, expert_b, offsets) * wrapper.scaling[adapter]
 
 
+def _grouped_local_expert_compute(
+    base: Any,
+    gate_wrapper: Any,
+    down_wrapper: Any,
+    hidden_states: torch.Tensor,
+    expert_ids: torch.Tensor,
+    weights: torch.Tensor,
+    global_offset: int,
+) -> torch.Tensor:
+    if hidden_states.numel() == 0:
+        return hidden_states
+    local_expert_ids = expert_ids - global_offset
+    permutation = torch.argsort(local_expert_ids)
+    inverse = torch.empty_like(permutation)
+    inverse[permutation] = torch.arange(permutation.numel(), device=hidden_states.device)
+    sorted_experts = local_expert_ids[permutation]
+    sorted_hidden = hidden_states[permutation]
+    counts = torch.bincount(sorted_experts, minlength=base.num_experts)
+    offsets = counts.cumsum(0, dtype=torch.int32)
+
+    gate_up = _grouped_linear(sorted_hidden, base.gate_up_proj, offsets)
+    gate_up = gate_up + _grouped_expert_delta(gate_wrapper, sorted_hidden, offsets)
+    gate, up = gate_up.chunk(2, dim=-1)
+    intermediate = base.act_fn(gate) * up
+    current = _grouped_linear(intermediate, base.down_proj, offsets)
+    current = current + _grouped_expert_delta(down_wrapper, intermediate, offsets)
+    sorted_weights = weights[permutation]
+    current = current * sorted_weights.unsqueeze(-1)
+    return current[inverse]
+
+
 def _install_active_expert_forward(
     peft_model: nn.Module,
     implementation: str,
+    moe_layout: MoeParallelLayout | None = None,
 ) -> int:
     """Avoid PEFT's full `[experts, out, in]` delta materialization.
 
@@ -216,6 +251,30 @@ def _install_active_expert_forward(
                 raise TypeError("unexpected arguments for Gemma expert LoRA")
             base, gate_wrapper, down_wrapper = _expert_layers(self)
 
+            if moe_layout is not None and moe_layout.enabled:
+                def local_forward(
+                    recv_hidden: torch.Tensor,
+                    recv_expert_ids: torch.Tensor,
+                    recv_weights: torch.Tensor,
+                ) -> torch.Tensor:
+                    return _grouped_local_expert_compute(
+                        base,
+                        gate_wrapper,
+                        down_wrapper,
+                        recv_hidden,
+                        recv_expert_ids,
+                        recv_weights,
+                        moe_layout.global_expert_offset,
+                    )
+
+                return expert_parallel_forward(
+                    x,
+                    top_k_index,
+                    top_k_weights,
+                    moe_layout,
+                    local_forward,
+                )
+
             num_tokens, hidden_dim = x.shape
             top_k = top_k_index.shape[-1]
             token_index = (
@@ -276,7 +335,7 @@ def _install_active_expert_forward(
             continue
         if isinstance(module.base_layer, ParamWrapper):
             raw = module.get_base_layer()
-            if raw.__class__.__name__ == "Gemma4TextExperts":
+            if raw.__class__.__name__ in EXPERT_LAYER_NAMES:
                 # Install an explicit specialized module at the same tree
                 # location. Copying the Module registry retains PEFT's exact
                 # parameter/state-dict names without rewriting Transformers
@@ -330,8 +389,7 @@ def discover_lora_targets(
             kind = "embedding"
         if name == output_name:
             kind = "lm_head"
-        if spec.moe and ".mlp." in name:
-            # Gemma 4 calls the always-active ninth expert `mlp`.
+        if spec.moe and ".mlp." in name and ".experts." not in name:
             rank = settings.expert_rank
             kind = "shared_expert"
             rank_pattern[name] = rank
@@ -386,6 +444,7 @@ def inject_lora(
     settings: LoraSettings,
     *,
     expert_implementation: str = "auto",
+    moe_layout: MoeParallelLayout | None = None,
 ) -> tuple[nn.Module, LoraAudit]:
     from peft import LoraConfig, TaskType, get_peft_model
 
@@ -431,9 +490,9 @@ def inject_lora(
     if spec.moe:
         if expert_implementation == "auto":
             expert_implementation = "eager"
-        installed = _install_active_expert_forward(peft_model, expert_implementation)
+        installed = _install_active_expert_forward(peft_model, expert_implementation, moe_layout)
         expected = sum(
-            1 for module in model.modules() if module.__class__.__name__ == "Gemma4TextExperts"
+            1 for module in model.modules() if module.__class__.__name__ in EXPERT_LAYER_NAMES
         )
         if installed != expected:
             raise RuntimeError(

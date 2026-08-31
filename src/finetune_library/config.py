@@ -145,6 +145,7 @@ class DistributedConfig(StrictModel):
     strategy: DistributedStrategy = DistributedStrategy.AUTO
     shard_size: PositiveInt | None = None
     replicate_size: PositiveInt | None = None
+    expert_parallel_size: PositiveInt = 1
     reduce_dtype: Literal["bfloat16", "float32"] = "bfloat16"
 
     @model_validator(mode="after")
@@ -155,6 +156,8 @@ class DistributedConfig(StrictModel):
             raise ValueError("hsdp requires shard_size and replicate_size")
         if self.strategy == DistributedStrategy.FSDP and self.replicate_size not in (None, 1):
             raise ValueError("fsdp cannot use replicate_size > 1")
+        if self.expert_parallel_size > 1 and self.strategy == DistributedStrategy.DDP:
+            raise ValueError("expert_parallel_size > 1 requires fsdp or hsdp")
         return self
 
 

@@ -34,6 +34,7 @@ from finetune_library.distributed import (
 )
 from finetune_library.logging_utils import EventLogger, setup_training_logger
 from finetune_library.lora import consolidate_tied_lora_gradients, inject_lora
+from finetune_library.moe_parallel import build_moe_layout, resolve_num_experts, slice_expert_parameters
 from finetune_library.loss import build_training_model
 from finetune_library.optim import build_optimizer, build_scheduler
 from finetune_library.registry import resolve_model
@@ -230,11 +231,29 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
             torch.backends.cuda.matmul.allow_tf32 = True
 
         runtime = load_runtime(config, spec, context)
+        moe_layout = None
+        if spec.moe and context.expert_parallel_size > 1:
+            num_experts = resolve_num_experts(runtime.model, spec.num_experts)
+            moe_layout = build_moe_layout(
+                num_experts=num_experts,
+                expert_parallel_size=context.expert_parallel_size,
+                mesh=context.mesh,
+            )
+            context.moe_layout = moe_layout
+            sliced = slice_expert_parameters(runtime.model, moe_layout)
+            if context.is_main:
+                logger.info(
+                    "MoE EP enabled: ep_size=%s sliced_modules=%s local_experts=%s",
+                    moe_layout.expert_parallel_size,
+                    sliced,
+                    moe_layout.local_num_experts,
+                )
         peft_model, audit = inject_lora(
             runtime.model,
             spec,
             config.lora,
             expert_implementation=config.runtime.experts,
+            moe_layout=moe_layout,
         )
         if config.checkpoint.resume_from:
             load_adapter(peft_model, config.checkpoint.resume_from)
