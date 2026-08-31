@@ -333,7 +333,8 @@ def expert_parallel_forward_deepep(
         layout.num_experts,
     )
     local_output = local_forward(recv_hidden, recv_expert_ids, recv_weights)
-    return _DeepEPCombine.apply(local_output, buffer, handle)
+    combined = _DeepEPCombine.apply(local_output, buffer, handle)
+    return combined.to(hidden_states.dtype)
 
 
 def _local_grouped_experts_forward(
