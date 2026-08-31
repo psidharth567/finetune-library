@@ -163,6 +163,12 @@ def _grouped_local_expert_compute(
     if hidden_states.numel() == 0:
         return hidden_states
     local_expert_ids = expert_ids - global_offset
+    if torch.any(local_expert_ids < 0) or torch.any(local_expert_ids >= base.num_experts):
+        raise RuntimeError(
+            "received expert ids outside the local shard: "
+            f"min={int(local_expert_ids.min())} max={int(local_expert_ids.max())} "
+            f"local={base.num_experts}"
+        )
     permutation = torch.argsort(local_expert_ids)
     inverse = torch.empty_like(permutation)
     inverse[permutation] = torch.arange(permutation.numel(), device=hidden_states.device)

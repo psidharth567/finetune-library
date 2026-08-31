@@ -38,7 +38,10 @@ runtime:
   model_kernels: native
   loss: fused_linear_cross_entropy
   experts: grouped_mm
-  torch_compile: false
+  moe_a2a_backend: native
+  torch_compile: true
+  compile_mode: reduce-overhead
+  compile_scope: blocks
   gradient_checkpointing: false
   use_cache: false
 checkpoint:

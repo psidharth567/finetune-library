@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Callable
 
 import torch
@@ -10,6 +11,48 @@ from torch.autograd import Function
 from torch.nn import functional as F
 
 EXPERT_MODULE_NAMES = frozenset({"Gemma4TextExperts", "Qwen3_5MoeExperts"})
+EXPERT_WRAPPER_NAMES = frozenset({"GroupedGemmaExpertWrapper", "EagerGemmaExpertWrapper"})
+
+
+def is_expert_module(module: nn.Module) -> bool:
+    layer: Any = module
+    if hasattr(module, "get_base_layer"):
+        try:
+            layer = module.get_base_layer()
+        except Exception:
+            layer = module
+    return layer.__class__.__name__ in EXPERT_MODULE_NAMES
+
+
+def is_expert_unit(module: nn.Module) -> bool:
+    if module.__class__.__name__ in EXPERT_MODULE_NAMES | EXPERT_WRAPPER_NAMES:
+        return True
+    return is_expert_module(module)
+
+
+def expert_parameters(model: nn.Module) -> set[nn.Parameter]:
+    params: set[nn.Parameter] = set()
+    for module in model.modules():
+        if is_expert_module(module):
+            params.update(module.parameters())
+    return params
+
+
+class MoeA2ABackend(StrEnum):
+    AUTO = "auto"
+    NATIVE = "native"
+    DEEPEP = "deepep"
+
+
+def resolve_a2a_backend(requested: str) -> MoeA2ABackend:
+    if requested == MoeA2ABackend.AUTO:
+        try:
+            import deep_ep  # noqa: F401
+
+            return MoeA2ABackend.DEEPEP
+        except Exception:
+            return MoeA2ABackend.NATIVE
+    return MoeA2ABackend(requested)
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +64,7 @@ class MoeParallelLayout:
     local_num_experts: int
     ep_group: Any
     dense_mesh: Any = None
+    a2a_backend: MoeA2ABackend = MoeA2ABackend.NATIVE
 
     @property
     def enabled(self) -> bool:
@@ -312,6 +356,7 @@ def build_moe_layout(
     num_experts: int,
     expert_parallel_size: int,
     mesh: Any,
+    a2a_backend: str = MoeA2ABackend.AUTO,
 ) -> MoeParallelLayout:
     if expert_parallel_size < 1:
         raise ValueError("expert_parallel_size must be >= 1")
@@ -333,6 +378,14 @@ def build_moe_layout(
             dense_mesh = mesh["dp_shard"]
         else:
             dense_mesh = mesh
+    resolved_backend = resolve_a2a_backend(a2a_backend)
+    if resolved_backend == MoeA2ABackend.DEEPEP:
+        try:
+            import deep_ep  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "runtime.moe_a2a_backend=deepep requires the deep_ep package"
+            ) from exc
     return MoeParallelLayout(
         num_experts=num_experts,
         expert_parallel_size=expert_parallel_size,
@@ -341,4 +394,5 @@ def build_moe_layout(
         local_num_experts=experts_per_rank,
         ep_group=ep_group,
         dense_mesh=dense_mesh,
+        a2a_backend=resolved_backend,
     )

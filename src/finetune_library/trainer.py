@@ -238,15 +238,17 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                 num_experts=num_experts,
                 expert_parallel_size=context.expert_parallel_size,
                 mesh=context.mesh,
+                a2a_backend=config.runtime.moe_a2a_backend,
             )
             context.moe_layout = moe_layout
             sliced = slice_expert_parameters(runtime.model, moe_layout)
             if context.is_main:
                 logger.info(
-                    "MoE EP enabled: ep_size=%s sliced_modules=%s local_experts=%s",
+                    "MoE EP enabled: ep_size=%s sliced_modules=%s local_experts=%s a2a=%s",
                     moe_layout.expert_parallel_size,
                     sliced,
                     moe_layout.local_num_experts,
+                    moe_layout.a2a_backend,
                 )
         peft_model, audit = inject_lora(
             runtime.model,

@@ -167,6 +167,7 @@ class RuntimeConfig(StrictModel):
     model_kernels: Literal["auto", "native", "liger"] = "auto"
     loss: Literal["auto", "cross_entropy", "fused_linear_cross_entropy"] = "auto"
     experts: Literal["auto", "eager", "grouped_mm"] = "auto"
+    moe_a2a_backend: Literal["auto", "native", "deepep"] = "auto"
     torch_compile: bool = False
     compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "default"
     compile_scope: Literal["full", "loss_only", "blocks"] = "full"

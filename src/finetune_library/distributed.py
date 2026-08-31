@@ -12,7 +12,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from finetune_library.config import DistributedConfig, DistributedStrategy
-from finetune_library.moe_parallel import MoeParallelLayout
+from finetune_library.moe_parallel import MoeParallelLayout, expert_parameters, is_expert_unit
 from finetune_library.registry import ModelSpec
 
 
@@ -33,7 +33,10 @@ class DistributedContext:
     dense_mesh: Any = None
     moe_layout: MoeParallelLayout | None = None
     initialized_here: bool = False
+    dp_shard_group: Any = None
+    dp_shard_size: int = 1
     replicated_trainables: tuple[nn.Parameter, ...] = ()
+    ep_replicated_trainables: tuple[nn.Parameter, ...] = ()
 
     @property
     def is_main(self) -> bool:
@@ -64,17 +67,22 @@ class DistributedContext:
         consolidated after this synchronization and before clipping/AdamW.
         """
 
-        if self.data_parallel_size <= 1:
-            return
-        for parameter in self.replicated_trainables:
-            if parameter.grad is None:
-                continue
-            # NCCL collectives require contiguous buffers, while the tied
-            # head-side gradient inherits its transposed parameter stride.
-            synchronized = parameter.grad.contiguous()
-            dist.all_reduce(synchronized, group=self.data_parallel_group)
-            synchronized.div_(self.data_parallel_size)
-            parameter.grad.copy_(synchronized)
+        if self.data_parallel_size > 1 and self.data_parallel_group is not None:
+            for parameter in self.replicated_trainables:
+                if parameter.grad is None:
+                    continue
+                synchronized = parameter.grad.contiguous()
+                dist.all_reduce(synchronized, group=self.data_parallel_group)
+                synchronized.div_(self.data_parallel_size)
+                parameter.grad.copy_(synchronized)
+        if self.dp_shard_size > 1 and self.dp_shard_group is not None:
+            for parameter in self.ep_replicated_trainables:
+                if parameter.grad is None:
+                    continue
+                synchronized = parameter.grad.contiguous()
+                dist.all_reduce(synchronized, group=self.dp_shard_group)
+                synchronized.div_(self.dp_shard_size)
+                parameter.grad.copy_(synchronized)
 
     @torch.no_grad()
     def clip_grad_norm(
@@ -180,6 +188,8 @@ def initialize_distributed(
 
     mesh = None
     dense_mesh = None
+    dp_shard_group = None
+    dp_shard_size = 1
     data_group = dist.group.WORLD if world_size > 1 else None
     if strategy == DistributedStrategy.DDP:
         shard_size, replicate_size = 1, world_size
@@ -206,6 +216,8 @@ def initialize_distributed(
                     mesh_dim_names=("dp_shard", "ep"),
                 )
                 dense_mesh = mesh["dp_shard"]
+                dp_shard_group = mesh.get_group("dp_shard")
+                dp_shard_size = mesh["dp_shard"].size()
                 data_group = None
                 data_rank, data_size = 0, 1
             else:
@@ -232,6 +244,8 @@ def initialize_distributed(
                     mesh_dim_names=("dp_replicate", "dp_shard", "ep"),
                 )
                 dense_mesh = mesh["dp_replicate", "dp_shard"]
+                dp_shard_group = mesh.get_group("dp_shard")
+                dp_shard_size = mesh["dp_shard"].size()
                 data_group = mesh["dp_replicate"].get_group()
                 data_rank = mesh.get_coordinate()[0]
                 data_size = replicate_size
@@ -261,18 +275,19 @@ def initialize_distributed(
         data_parallel_group=data_group,
         mesh=mesh,
         dense_mesh=dense_mesh,
+        dp_shard_group=dp_shard_group,
+        dp_shard_size=dp_shard_size,
         initialized_here=initialized_here,
     )
 
 
 def _layer_shard_units(layer: nn.Module, spec: ModelSpec) -> list[nn.Module]:
-    units: list[nn.Module] = []
     for child in layer.children():
         if child.__class__.__name__ == "Qwen3_5MoeSparseMoeBlock":
-            units.extend(list(child.children()))
-        else:
-            units.append(child)
-    return units or [layer]
+            return list(child.children())
+    if any(is_expert_unit(child) for child in layer.children()):
+        return list(layer.children())
+    return [layer]
 
 
 def wrap_model(
@@ -302,10 +317,19 @@ def wrap_model(
         output_dtype=torch.bfloat16,
     )
     ignored = _noncontiguous_storage_groups(model)
+    ep_params: set[nn.Parameter] = set()
+    if context.expert_parallel_size > 1:
+        ep_params = expert_parameters(model)
+        ignored |= ep_params
     context.replicated_trainables = tuple(
         parameter
         for parameter in model.parameters()
-        if parameter in ignored and parameter.requires_grad
+        if parameter in ignored and parameter.requires_grad and parameter not in ep_params
+    )
+    context.ep_replicated_trainables = tuple(
+        parameter
+        for parameter in model.parameters()
+        if parameter in ep_params and parameter.requires_grad
     )
     shard_mesh = context.dense_mesh or context.mesh
     layers = [module for module in model.modules() if module.__class__.__name__ == spec.layer_class]
@@ -316,6 +340,8 @@ def wrap_model(
         layer_ignored = ignored.intersection(layer_parameters)
         units = _layer_shard_units(layer, spec) if spec.moe and context.expert_parallel_size > 1 else [layer]
         for unit in units:
+            if context.expert_parallel_size > 1 and is_expert_unit(unit):
+                continue
             unit_parameters = set(unit.parameters())
             unit_ignored = ignored.intersection(unit_parameters)
             fully_shard(
