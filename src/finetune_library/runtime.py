@@ -315,7 +315,9 @@ def load_runtime(
         model_kernels=model_kernels,
     )
 
-def _maybe_compile_grouped_moe(model: nn.Module, mode: str) -> None:
+def _maybe_compile_grouped_moe(model: nn.Module, mode: str, *, expert_parallel_size: int = 1) -> None:
+    if expert_parallel_size > 1:
+        return
     try:
         import finetune_library.lora as lora_mod
         orig = getattr(lora_mod, "_grouped_linear", None)
@@ -330,7 +332,12 @@ def _maybe_compile_grouped_moe(model: nn.Module, mode: str) -> None:
         pass
 
 
-def maybe_compile(model: nn.Module, config: ExperimentConfig) -> nn.Module:
+def maybe_compile(
+    model: nn.Module,
+    config: ExperimentConfig,
+    *,
+    expert_parallel_size: int = 1,
+) -> nn.Module:
     if not config.runtime.torch_compile:
         return model
     # Liger kernels use custom Triton ops that currently hang inductor's
@@ -373,14 +380,26 @@ def maybe_compile(model: nn.Module, config: ExperimentConfig) -> nn.Module:
     except Exception:
         pass
     scope = getattr(config.runtime, "compile_scope", "full")
+    compile_kwargs = {
+        "mode": config.runtime.compile_mode,
+        "dynamic": False,
+        "fullgraph": False,
+    }
     if scope == "loss_only":
         if hasattr(model, "lm_head"):
             try:
-                model.lm_head = torch.compile(model.lm_head, mode=config.runtime.compile_mode, dynamic=False, fullgraph=True)
+                model.lm_head = torch.compile(
+                    model.lm_head,
+                    mode=config.runtime.compile_mode,
+                    dynamic=False,
+                    fullgraph=True,
+                )
             except Exception:
                 pass
         return model
     if scope == "blocks":
+        from finetune_library.moe_parallel import is_expert_unit
+
         blocks = None
         for attr in ("model", "language_model", "model.layers", "layers"):
             try:
@@ -399,15 +418,32 @@ def maybe_compile(model: nn.Module, config: ExperimentConfig) -> nn.Module:
                     break
         if blocks is not None:
             for i, block in enumerate(blocks):
-                try:
-                    blocks[i] = torch.compile(block, mode=config.runtime.compile_mode, dynamic=False, fullgraph=False)
-                except Exception:
-                    pass
-        _maybe_compile_grouped_moe(model, config.runtime.compile_mode)
+                if expert_parallel_size > 1:
+                    for child_name, child in block.named_children():
+                        if is_expert_unit(child):
+                            continue
+                        try:
+                            setattr(block, child_name, torch.compile(child, **compile_kwargs))
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        blocks[i] = torch.compile(block, **compile_kwargs)
+                    except Exception:
+                        pass
+        _maybe_compile_grouped_moe(
+            model,
+            config.runtime.compile_mode,
+            expert_parallel_size=expert_parallel_size,
+        )
         return model
     compiled = cast(
         nn.Module,
         torch.compile(model, mode=config.runtime.compile_mode, dynamic=False, fullgraph=False),
     )
-    _maybe_compile_grouped_moe(compiled, config.runtime.compile_mode)
+    _maybe_compile_grouped_moe(
+        compiled,
+        config.runtime.compile_mode,
+        expert_parallel_size=expert_parallel_size,
+    )
     return compiled

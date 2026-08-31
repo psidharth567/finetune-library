@@ -348,6 +348,8 @@ def _install_active_expert_forward(
                 # source or mutating the existing object's class.
                 replacement = wrapper_class.__new__(wrapper_class)
                 replacement.__dict__ = module.__dict__.copy()
+                if moe_layout is not None and moe_layout.enabled:
+                    replacement.forward = torch.compiler.disable(replacement.forward)  # type: ignore[method-assign]
                 parent_name, _, child_name = name.rpartition(".")
                 parent = (
                     peft_model.get_submodule(parent_name)

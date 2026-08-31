@@ -281,11 +281,19 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
         except Exception:
             is_sharded = False
         if is_sharded and config.runtime.torch_compile:
-            training_model = maybe_compile(training_model, config)
+            training_model = maybe_compile(
+                training_model,
+                config,
+                expert_parallel_size=context.expert_parallel_size,
+            )
             model = wrap_model(training_model, context, spec, config.distributed)
         else:
             model = wrap_model(training_model, context, spec, config.distributed)
-            model = maybe_compile(model, config)
+            model = maybe_compile(
+                model,
+                config,
+                expert_parallel_size=context.expert_parallel_size,
+            )
         tracking.watch(model)
         optimizer = build_optimizer(model, config.optimizer, effective_lr=config.effective_learning_rate())
 
