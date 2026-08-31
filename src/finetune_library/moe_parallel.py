@@ -243,6 +243,42 @@ def _get_deepep_buffer(ep_group: Any, hidden_dim: int, param_bytes: int = 2) -> 
     return _deepep_buffer
 
 
+def _flatten_deepep_assignments(
+    hidden_states: torch.Tensor,
+    expert_ids: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if expert_ids.ndim == 1:
+        mask = expert_ids >= 0
+        token_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device)[mask]
+        return (
+            hidden_states[mask],
+            expert_ids[mask],
+            weights[mask],
+            token_indices,
+        )
+    mask = expert_ids >= 0
+    valid_ids = expert_ids[mask]
+    valid_weights = weights[mask]
+    token_indices = (
+        torch.arange(hidden_states.shape[0], device=hidden_states.device)
+        .unsqueeze(1)
+        .expand_as(expert_ids)[mask]
+    )
+    flat_hidden = hidden_states.index_select(0, token_indices)
+    return flat_hidden, valid_ids, valid_weights, token_indices
+
+
+def _scatter_deepep_assignments(
+    expert_output: torch.Tensor,
+    token_indices: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    output = expert_output.new_zeros(num_tokens, expert_output.shape[-1])
+    output.index_add_(0, token_indices, expert_output.to(output.dtype))
+    return output
+
+
 class _DeepEPDispatch(Function):
     @staticmethod
     def forward(
@@ -332,8 +368,18 @@ def expert_parallel_forward_deepep(
         buffer,
         layout.num_experts,
     )
-    local_output = local_forward(recv_hidden, recv_expert_ids, recv_weights)
-    combined = _DeepEPCombine.apply(local_output, buffer, handle)
+    flat_hidden, flat_ids, flat_weights, token_indices = _flatten_deepep_assignments(
+        recv_hidden,
+        recv_expert_ids,
+        recv_weights,
+    )
+    local_output = local_forward(flat_hidden, flat_ids, flat_weights)
+    per_token_output = _scatter_deepep_assignments(
+        local_output,
+        token_indices,
+        recv_hidden.shape[0],
+    )
+    combined = _DeepEPCombine.apply(per_token_output, buffer, handle)
     return combined.to(hidden_states.dtype)
 
 
