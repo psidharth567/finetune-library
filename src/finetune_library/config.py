@@ -163,7 +163,14 @@ class DistributedConfig(StrictModel):
 
 class RuntimeConfig(StrictModel):
     backend: RuntimeBackend = RuntimeBackend.AUTO
-    attention: Literal["auto", "sdpa", "flash_attention_2", "eager", "flex_attention"] = "auto"
+    attention: Literal[
+        "auto",
+        "sdpa",
+        "flash_attention_2",
+        "flash_attention_3",
+        "eager",
+        "flex_attention",
+    ] = "auto"
     model_kernels: Literal["auto", "native", "liger"] = "auto"
     loss: Literal["auto", "cross_entropy", "fused_linear_cross_entropy"] = "auto"
     experts: Literal["auto", "eager", "grouped_mm"] = "auto"

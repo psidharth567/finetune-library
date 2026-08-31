@@ -84,6 +84,8 @@ def select_attention(config: ExperimentConfig, spec: ModelSpec) -> str:
     for candidate in spec.attention_candidates:
         if candidate == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
             continue
+        if candidate == "flash_attention_3" and importlib.util.find_spec("flash_attn_3") is None:
+            continue
         return candidate
     return "sdpa"
 
