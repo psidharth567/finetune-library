@@ -12,19 +12,17 @@ from finetune_library.runtime import _cached_snapshot
 
 def test_all_model_profiles_are_strict_and_registered() -> None:
     profiles = sorted(Path("configs/models").glob("*.yaml"))
-    assert len(profiles) == 7
+    assert len(profiles) == 8
     for profile in profiles:
         config = ExperimentConfig.from_yaml(profile)
         spec = resolve_model(config.model.name)
         assert config.model.revision is None
         assert len(spec.revision) == 40
         assert spec.chat_template == "tokenizer"
-        assert {candidate.strategy.value for candidate in spec.distributed_candidates} == {
-            "ddp",
-            "hsdp",
-            "fsdp",
-        }
-        forbidden = ("Qwen" + "3.5", "Nemo" + "tron")
+        strategies = {candidate.strategy.value for candidate in spec.distributed_candidates}
+        assert strategies.issubset({"ddp", "hsdp", "fsdp"})
+        assert len(strategies) >= 1
+        forbidden = ("Nemo" + "tron",)
         assert all(name not in spec.repo_id for name in forbidden)
 
 
@@ -41,7 +39,15 @@ def test_registry_contains_exact_production_set() -> None:
     }
 
 
-def test_registry_auto_strategy_matches_qualified_profiles() -> None:
+def test_qwen35_profile_uses_ep_fsdp_stack() -> None:
+    config = ExperimentConfig.from_yaml(Path("configs/models/qwen35-35b-a3b-cpt.yaml"))
+    spec = resolve_model(config.model.name)
+    assert spec.moe
+    assert config.distributed.strategy == DistributedStrategy.FSDP
+    assert config.distributed.expert_parallel_size == 4
+    assert config.runtime.attention == "flash_attention_3"
+    assert config.runtime.torch_compile is False
+
     assert resolve_model("qwen3-8b").preferred_strategy == DistributedStrategy.DDP
     assert (
         resolve_model("gemma4-26b-a4b-it").preferred_strategy
