@@ -1,0 +1,47 @@
+version: 1
+task: cpt
+model:
+  name: qwen3.5-35b-a3b
+  cache_dir: /projects/data/llmteam/sanjay/bhili-mv/cache
+data:
+  format: text
+  path: data/cpt_train_longest_20k/train_packed_2048.jsonl
+  cache_dir: .cache/benchmark-prepared
+  max_samples: 2
+  packing: true
+  drop_remainder: true
+training:
+  output_dir: outputs/smoke-qwen35-35b-ep-fsdp-fla-fa3-liger-2k-r32
+  max_seq_length: 2048
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 1
+  log_every_steps: 1
+  dataloader_workers: 0
+lora:
+  rank: 32
+  alpha: 64
+  dropout: 0.0
+  expert_rank: 4
+optimizer:
+  name: adamw
+  learning_rate: 0.0002
+scheduler:
+  name: cosine
+  warmup_ratio: 0.03
+distributed:
+  strategy: fsdp
+  expert_parallel_size: 4
+runtime:
+  backend: native
+  attention: flash_attention_3
+  model_kernels: liger
+  loss: fused_linear_cross_entropy
+  experts: grouped_mm
+  moe_a2a_backend: native
+  torch_compile: false
+  gradient_checkpointing: true
+  use_cache: false
+checkpoint:
+  save_every_steps: 0
+  save_final: false
