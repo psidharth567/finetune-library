@@ -50,6 +50,18 @@ def _cached_snapshot(
     return None
 
 
+def _model_uses_liger_kernels(model: nn.Module) -> bool:
+    """Return True when Liger Triton kernels are active in the module tree."""
+    for module in model.modules():
+        name = module.__class__.__name__
+        if name.startswith("Liger"):
+            return True
+        module_path = getattr(module.__class__, "__module__", "")
+        if module_path.startswith("liger_kernel"):
+            return True
+    return False
+
+
 def _apply_liger_kernels(model: nn.Module, spec: ModelSpec) -> None:
     from liger_kernel import transformers as liger  # type: ignore[import-untyped]
 
@@ -321,8 +333,8 @@ def load_runtime(
         model_kernels=model_kernels,
     )
 
-def _maybe_compile_grouped_moe(model: nn.Module, mode: str, *, expert_parallel_size: int = 1) -> None:
-    if expert_parallel_size > 1:
+def _maybe_compile_grouped_moe(model: nn.Module, mode: str, *, expert_parallel_size: int = 1, enabled: bool = True) -> None:
+    if expert_parallel_size > 1 or not enabled:
         return
     try:
         import finetune_library.lora as lora_mod
@@ -343,23 +355,14 @@ def maybe_compile(
     config: ExperimentConfig,
     *,
     expert_parallel_size: int = 1,
+    model_kernels: str = "native",
 ) -> nn.Module:
     if not config.runtime.torch_compile:
         return model
-    # Liger kernels use custom Triton ops that currently hang inductor's
-    # cudagraph/block capture on H100 (swiglu tiling warning). For hard wins
-    # we keep liger without inductor; compile path is reserved for native.
-    try:
-        is_liger = False
-        # Detect via model_kernels attribute or liger-patched modules
-        for m in model.modules():
-            if m.__class__.__name__ in ("LigerRMSNorm", "LigerSwiGLUMLP", "LigerGEGLUMLP"):
-                is_liger = True
-                break
-        if is_liger:
-            return model
-    except Exception:
-        pass
+    # Liger patches HF modules in-place (class names stay Gemma4*/Qwen3*), so also
+    # consult the resolved kernel profile from load_runtime.
+    if model_kernels == "liger" or _model_uses_liger_kernels(model):
+        return model
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
@@ -371,7 +374,10 @@ def maybe_compile(
         pass
     try:
         import torch._inductor.config as inductor_config  # type: ignore[import-untyped]
-        inductor_config.triton.cudagraphs = True
+        uses_grouped_mm = config.runtime.experts == "grouped_mm"
+        # torch._grouped_mm inside inductor cudagraphs fails stride checks on
+        # Gemma MoE (reduce-overhead mode). Keep compile but disable cudagraphs.
+        inductor_config.triton.cudagraphs = not uses_grouped_mm
         inductor_config.coordinate_descent_tuning = True
         inductor_config.epilogue_fusion = True
         inductor_config.triton.unique_kernel_names = True
@@ -386,8 +392,15 @@ def maybe_compile(
     except Exception:
         pass
     scope = getattr(config.runtime, "compile_scope", "full")
+    if config.runtime.experts == "grouped_mm" and scope in {"full", "blocks"}:
+        # Inductor cannot lower torch._grouped_mm inside compiled decoder blocks.
+        scope = "loss_only"
+    compile_mode = config.runtime.compile_mode
+    if config.runtime.experts == "grouped_mm" and compile_mode == "reduce-overhead":
+        # reduce-overhead captures inductor CUDA graphs that break on torch._grouped_mm.
+        compile_mode = "default"
     compile_kwargs = {
-        "mode": config.runtime.compile_mode,
+        "mode": compile_mode,
         "dynamic": False,
         "fullgraph": False,
     }
@@ -396,7 +409,7 @@ def maybe_compile(
             try:
                 model.lm_head = torch.compile(
                     model.lm_head,
-                    mode=config.runtime.compile_mode,
+                    mode=compile_mode,
                     dynamic=False,
                     fullgraph=True,
                 )
@@ -439,17 +452,19 @@ def maybe_compile(
                         pass
         _maybe_compile_grouped_moe(
             model,
-            config.runtime.compile_mode,
+            compile_mode,
             expert_parallel_size=expert_parallel_size,
+            enabled=config.runtime.experts != "grouped_mm",
         )
         return model
     compiled = cast(
         nn.Module,
-        torch.compile(model, mode=config.runtime.compile_mode, dynamic=False, fullgraph=False),
+        torch.compile(model, mode=compile_mode, dynamic=False, fullgraph=False),
     )
     _maybe_compile_grouped_moe(
         compiled,
-        config.runtime.compile_mode,
+        compile_mode,
         expert_parallel_size=expert_parallel_size,
+        enabled=config.runtime.experts != "grouped_mm",
     )
     return compiled

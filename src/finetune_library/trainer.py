@@ -285,6 +285,7 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                 training_model,
                 config,
                 expert_parallel_size=context.expert_parallel_size,
+                model_kernels=runtime.model_kernels,
             )
             model = wrap_model(training_model, context, spec, config.distributed)
         else:
@@ -293,6 +294,7 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                 model,
                 config,
                 expert_parallel_size=context.expert_parallel_size,
+                model_kernels=runtime.model_kernels,
             )
         tracking.watch(model)
         optimizer = build_optimizer(model, config.optimizer, effective_lr=config.effective_learning_rate())
