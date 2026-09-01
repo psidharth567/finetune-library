@@ -66,7 +66,10 @@ def _apply_liger_kernels(model: nn.Module, spec: ModelSpec) -> None:
     elif spec.key == "olmo3-32b-think-dpo":
         liger.apply_liger_kernel_to_olmo3(rope=True, swiglu=True, **common)
     elif spec.key.startswith("qwen3.5-"):
-        apply = getattr(liger, "apply_liger_kernel_to_qwen3_5", None)
+        if spec.moe:
+            apply = getattr(liger, "apply_liger_kernel_to_qwen3_5_moe", None)
+        else:
+            apply = getattr(liger, "apply_liger_kernel_to_qwen3_5", None)
         if callable(apply):
             # Qwen 3.5 hybrid GDN+attention blocks do not support Liger RoPE yet.
             apply(rope=False, swiglu=True, **common)
