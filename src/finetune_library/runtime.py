@@ -68,7 +68,8 @@ def _apply_liger_kernels(model: nn.Module, spec: ModelSpec) -> None:
     elif spec.key.startswith("qwen3.5-"):
         apply = getattr(liger, "apply_liger_kernel_to_qwen3_5", None)
         if callable(apply):
-            apply(rope=True, swiglu=True, **common)
+            # Qwen 3.5 hybrid GDN+attention blocks do not support Liger RoPE yet.
+            apply(rope=False, swiglu=True, **common)
         else:
             raise ValueError(f"no Liger model-kernel profile for {spec.key}")
     elif spec.key.startswith("gemma4-"):
