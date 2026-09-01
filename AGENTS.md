@@ -24,9 +24,9 @@ bash "${FINETUNE_LIBRARY_ROOT}/scripts/run-on-gpu-node.sh" \
   configs/models/qwen35-35b-a3b-cpt.yaml
 ```
 
-Image: `ghcr.io/psidharth567/toolkit/finetune:12.8-cu129` (or local `toolkit-finetune:12.8-cu129-fa3`).
+Image: `ghcr.io/psidharth567/toolkit/finetune:12.8-cu129` (local alias: `toolkit/finetune:12.8-cu129`).
 
-**Docker note:** use `--entrypoint bash` — the legacy FA3 image had `ENTRYPOINT ["bash"]` which breaks `docker run ... bash -lc`.
+All kernels (FA2, FA3, Liger, FLA, TileLang, DeepEP) are baked into the image — no runtime install scripts needed.
 
 ### Option B — venv
 

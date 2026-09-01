@@ -21,7 +21,6 @@ export HF_HOME=/projects/data/llmteam/sidharth/toolkit/grpo-library
 export FLA_SKIP_TRITON_AUTOTUNE=1
 
 docker run --rm --gpus all --ipc=host --shm-size=16g \
-  --entrypoint bash \
   -e HF_HOME -e FLA_SKIP_TRITON_AUTOTUNE \
   -v /projects/data/llmteam/sidharth/toolkit:/workspace \
   ghcr.io/psidharth567/toolkit/finetune:12.8-cu129 -lc '
