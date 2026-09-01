@@ -28,8 +28,9 @@ docker run --rm --gpus all --ipc=host --shm-size=16g \
   "${IMAGE}" -lc "
     set -euo pipefail
     cd /workspace/finetune-library
+    uv pip install -e . --no-deps -q
     bash scripts/install_fla.sh
-    python -c 'import liger_kernel; from liger_kernel import transformers as l; print(\"qwen3.5 liger:\", hasattr(l, \"apply_liger_kernel_to_qwen3_5\"))'
+    python -c 'import liger_kernel; from liger_kernel import transformers as l; print(\"qwen3.5 moe liger:\", hasattr(l, \"apply_liger_kernel_to_qwen3_5_moe\"))'
     scripts/production/launch-one-node.sh ${CONFIG} ${COMMAND}
   " 2>&1 | tee "${LOG}"
 REMOTE
