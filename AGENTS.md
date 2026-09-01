@@ -24,7 +24,7 @@ bash "${FINETUNE_LIBRARY_ROOT}/scripts/run-on-gpu-node.sh" \
   configs/models/qwen35-35b-a3b-cpt.yaml
 ```
 
-Image: `ghcr.io/psidharth567/toolkit/finetune:12.8-cu129` (local alias: `toolkit/finetune:12.8-cu129`).
+Image: `ghcr.io/psidharth567/toolkit/finetune:12.8-cu129` (local build tag: `toolkit/finetune:12.8-cu129`).
 
 All kernels (FA2, FA3, Liger, FLA, TileLang, DeepEP) are baked into the image — no runtime install scripts needed.
 

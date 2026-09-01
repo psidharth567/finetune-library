@@ -6,7 +6,7 @@ export HF_HOME=/projects/data/llmteam/sidharth/toolkit/grpo-library
 CONFIG="${1:?usage: run-gemma4-ddp-smoke.sh CONFIG}"
 LOG="${2:-/projects/data/llmteam/sidharth/toolkit/finetune-library/logs/gemma4-smoke.log}"
 COMMAND="${3:-train}"
-IMAGE="${IMAGE:-toolkit-finetune:12.8-cu129-fa3}"
+IMAGE="${IMAGE:-ghcr.io/psidharth567/toolkit/finetune:12.8-cu129}"
 NODE="${NODE:-bodhanai-node043}"
 
 mkdir -p "$(dirname "$LOG")"
@@ -20,7 +20,6 @@ COMMAND="$4"
 export HF_HOME=/projects/data/llmteam/sidharth/toolkit/grpo-library
 
 docker run --rm --gpus all --ipc=host --shm-size=16g \
-  --entrypoint bash \
   -e HF_HOME \
   -v /projects/data/llmteam/sidharth/toolkit:/workspace \
   "${IMAGE}" -lc "

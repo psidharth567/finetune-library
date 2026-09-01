@@ -9,7 +9,7 @@ CONFIG="${1:?usage: run-on-gpu-node.sh CONFIG [LOG] [COMMAND]}"
 LOG="${2:-/projects/data/llmteam/sidharth/toolkit/finetune-library/logs/run.log}"
 COMMAND="${3:-train}"
 NODE="${NODE:-bodhanai-node043}"
-IMAGE="${IMAGE:-toolkit/finetune:12.8-cu129}"
+IMAGE="${IMAGE:-ghcr.io/psidharth567/toolkit/finetune:12.8-cu129}"
 
 mkdir -p "$(dirname "$LOG")"
 
