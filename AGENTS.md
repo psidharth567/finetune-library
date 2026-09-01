@@ -26,7 +26,14 @@ bash "${FINETUNE_LIBRARY_ROOT}/scripts/run-on-gpu-node.sh" \
 
 Image: `ghcr.io/psidharth567/toolkit/finetune:12.8-cu129` (local build tag: `toolkit/finetune:12.8-cu129`).
 
-All kernels (FA2, FA3, Liger, FLA, TileLang, DeepEP) are baked into the image — no runtime install scripts needed.
+Baked into the image at `/opt/toolkit/finetune-library`:
+- `src/` + `finetune-lib` CLI
+- `configs/models/`, `configs/benchmarks/`, `configs/examples/`
+- `scripts/production/`, `scripts/slurm/`, `scripts/verify-finetune-image.sh`
+- `tests/` (CPU unit tests run at image build and via verify script)
+- All kernels (FA2, FA3, Liger, FLA, TileLang, DeepEP)
+
+Mount `/workspace/finetune-library` only when iterating on library code.
 
 ### Option B — venv
 

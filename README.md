@@ -16,16 +16,27 @@ bash scripts/install_fla.sh   # Qwen 3.5 GDN only
 
 ## Quick start (Docker — recommended on GPU nodes)
 
+Configs, launch scripts, and unit tests are baked into the image at
+`/opt/toolkit/finetune-library`. Mount the repo only when developing live code.
+
 ```bash
 export HF_HOME=/projects/data/llmteam/sidharth/toolkit/grpo-library
 export FLA_SKIP_TRITON_AUTOTUNE=1
 
 docker run --rm --gpus all --ipc=host --shm-size=16g \
   -e HF_HOME -e FLA_SKIP_TRITON_AUTOTUNE \
+  ghcr.io/psidharth567/toolkit/finetune:12.8-cu129 -lc \
+  'scripts/production/launch-one-node.sh configs/models/qwen3-8b-cpt.yaml train'
+```
+
+For live code from a git checkout, mount and reinstall editable:
+
+```bash
+docker run --rm --gpus all --ipc=host --shm-size=16g \
+  -e HF_HOME -e FLA_SKIP_TRITON_AUTOTUNE \
   -v /projects/data/llmteam/sidharth/toolkit:/workspace \
   ghcr.io/psidharth567/toolkit/finetune:12.8-cu129 -lc '
-    cd /workspace/finetune-library
-    uv pip install -e . --no-deps -q
+    cd /workspace/finetune-library && uv pip install -e . --no-deps -q
     scripts/production/launch-one-node.sh configs/models/qwen3-8b-cpt.yaml train
   '
 ```

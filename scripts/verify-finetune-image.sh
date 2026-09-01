@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
-# Verify the finetune container has the expected kernel stack.
+# Verify the finetune container has the expected kernel stack and baked library tree.
 set -euo pipefail
+
+ROOT="${FINETUNE_LIBRARY_ROOT:-/opt/toolkit/finetune-library}"
+
+for path in \
+  "${ROOT}/scripts/production/launch-one-node.sh" \
+  "${ROOT}/configs/models/qwen35-35b-a3b-cpt.yaml" \
+  "${ROOT}/tests/test_config_registry.py"; do
+  if [[ ! -e "${path}" ]]; then
+    echo "MISSING baked path: ${path}"
+    exit 1
+  fi
+  echo "OK      ${path#${ROOT}/}"
+done
 
 python - <<'PY'
 import importlib.util as u
@@ -36,3 +49,9 @@ PY
 
 finetune-lib --help >/dev/null
 echo "finetune-lib CLI ok"
+
+cd "${ROOT}"
+python -m pytest tests/test_config_registry.py \
+  tests/test_liger_compile_guard.py \
+  tests/test_moe_ep_unit.py -q
+echo "unit tests ok"
