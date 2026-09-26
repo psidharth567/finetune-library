@@ -1,0 +1,21 @@
+.venv/
+.venv.bak/
+outputs/
+logs/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+hf_ep/
+.git/
+
+# Big data — keep only the tiny checked-in smoke fixtures.
+data/*
+!data/dummy_cpt.jsonl
+!data/dummy_sft.jsonl
+
+# Wheels are COPYed explicitly by the Dockerfile from a fixed set of files;
+# do not exclude the directory itself.

@@ -3,7 +3,7 @@
 # On Hopper, use TileLang for GDN backward (FLA #640) and keep Triton 3.6.0.
 set -euo pipefail
 
-export HF_HOME="${HF_HOME:-/projects/data/llmteam/sidharth/toolkit/grpo-library}"
+export HF_HOME="${HF_HOME:-/projects/data/llmteam/sidharth/toolkit/finetune-library/.cache/huggingface}"
 
 if python3 -c "from transformers.utils.import_utils import is_flash_linear_attention_available; import sys; sys.exit(0 if is_flash_linear_attention_available() else 1)" 2>/dev/null; then
   python3 -c "
