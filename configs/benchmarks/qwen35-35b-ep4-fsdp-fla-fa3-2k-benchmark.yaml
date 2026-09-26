@@ -2,7 +2,6 @@ version: 1
 task: cpt
 model:
   name: qwen3.5-35b-a3b
-  cache_dir: /projects/data/llmteam/sanjay/bhili-mv/cache
 data:
   format: text
   path: data/cpt_train_longest_20k/train_packed_2048.jsonl

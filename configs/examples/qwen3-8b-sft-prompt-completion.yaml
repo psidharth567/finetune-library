@@ -22,7 +22,7 @@ optimizer:
 scheduler: {name: cosine, warmup_ratio: 0.03}
 distributed: {strategy: ddp}
 runtime:
-  backend: unsloth
+  backend: native
   attention: sdpa
   model_kernels: auto
   loss: fused_linear_cross_entropy

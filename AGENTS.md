@@ -1,48 +1,68 @@
 # finetune-lib — Agent instructions
 
-LoRA CPT/SFT toolkit. Each project keeps data, configs, and outputs under
-`<project>/finetune/`; the library lives at a fixed path.
+LoRA CPT/SFT toolkit. This is a standalone repo — all paths below are
+relative to the repo root.
 
 ## Toolkit location
 
 ```bash
-export FINETUNE_LIBRARY_ROOT=/projects/data/llmteam/sidharth/toolkit/finetune-library
-export HF_HOME="${HF_HOME:-/projects/data/llmteam/sidharth/toolkit/grpo-library}"
+export FINETUNE_LIBRARY_ROOT=/path/to/finetune-library   # repo root
+export HF_HOME="${HF_HOME:-${FINETUNE_LIBRARY_ROOT}/.cache/huggingface}"
 ```
 
-`/home/` is out of space. **Always** set `HF_HOME` under `/projects/...`.
+Always set `HF_HOME` under a project/data volume, not `~/`.
 
 ## Environment
 
-### Option A — Docker (recommended on GPU nodes)
+### Option A — Docker (standalone image, recommended on GPU nodes)
+
+The image is self-contained: build context is the repo root, no dependency
+on any sibling project.
 
 ```bash
-export HF_HOME=/projects/data/llmteam/sidharth/toolkit/grpo-library
+export HF_HOME="${FINETUNE_LIBRARY_ROOT}/.cache/huggingface"
 export FLA_SKIP_TRITON_AUTOTUNE=1
 
-bash "${FINETUNE_LIBRARY_ROOT}/scripts/run-on-gpu-node.sh" \
-  configs/models/qwen35-35b-a3b-cpt.yaml
+"${FINETUNE_LIBRARY_ROOT}/scripts/run.sh" configs/models/qwen35-35b-a3b-cpt.yaml train
 ```
 
-Image: `ghcr.io/psidharth567/toolkit/finetune:12.8-cu129` (local build tag: `toolkit/finetune:12.8-cu129`).
+Build tag: `toolkit/finetune:latest` (or any `TAG` via `scripts/build.sh`).
+`NODE=<host>` on `build.sh`/`run.sh` builds/runs over ssh; unset runs on the
+current host.
+
+Before building, populate `wheels/` (gitignored) with the cp312/cu129/
+torch-2.11 wheels: `flash_attn`, `flash_attn_3`, `deep_ep`, `causal_conv1d`,
+`mamba_ssm`. A missing wheel is a hard build failure unless
+`ALLOW_MISSING_WHEELS=1`. `unsloth` is not installed by default (broken under
+torch 2.11); opt in with `--build-arg INSTALL_UNSLOTH=1` if you specifically
+need it — no production config requires it.
 
 Baked into the image at `/opt/toolkit/finetune-library`:
 - `src/` + `finetune-lib` CLI
 - `configs/models/`, `configs/benchmarks/`, `configs/examples/`
-- `scripts/production/`, `scripts/slurm/`, `scripts/verify-finetune-image.sh`
-- `tests/` (CPU unit tests run at image build and via verify script)
-- All kernels (FA2, FA3, Liger, FLA, TileLang, DeepEP)
+- `scripts/production/`, `scripts/slurm/`
+- `tests/` (full CPU unit test suite runs at image build time; GPU-only
+  tests self-skip)
+- All kernels (FA2, FA3, Liger, FLA, TileLang, DeepEP), installed from
+  `wheels/` at build time
 
-Mount `/workspace/finetune-library` only when iterating on library code.
+`DEV=1 scripts/run.sh ...` bind-mounts live source over
+`/opt/toolkit/finetune-library` for iterating on library code without
+rebuilding.
+
+`scripts/run.sh` runs as the invoking host uid:gid by default
+(`RUN_AS_ROOT=1` to skip that), forwards NCCL env vars and every `FINETUNE_*`
+env var set on the host, and sets `HF_HUB_OFFLINE=1` inside the container by
+default (fails loudly on a missing pinned revision instead of downloading).
 
 ### Option B — venv
 
 ```bash
 cd "${FINETUNE_LIBRARY_ROOT}"
-uv sync --extra dev --extra unsloth --extra flash
+uv sync --extra dev --extra flash   # add --extra unsloth only if you need it (broken under torch 2.11; opt-in)
 source .venv/bin/activate
-bash scripts/install_fla.sh        # Qwen 3.5 only
-pip install --no-deps containers/wheels/extra/deep_ep-*.whl  # optional EP
+bash scripts/install_fla.sh                 # Qwen 3.5 only
+pip install --no-deps wheels/deep_ep-*.whl  # optional EP
 ```
 
 Stack: Python 3.12, PyTorch 2.11+cu129, Transformers 5.5, PEFT 0.19, Liger 0.8.1.
@@ -85,9 +105,55 @@ New models require a `ModelSpec` entry in `src/finetune_library/registry.py` —
 
 | Model class | attention | model_kernels | experts | compile | notes |
 |---|---|---|---|---|---|
-| Qwen3 dense | sdpa / fa2 | liger (auto) | auto | **off** | Unsloth ok on 8B/14B |
+| Qwen3 dense | sdpa / fa2 | liger (auto) | auto | **off** | `backend: native`; Unsloth is opt-in, not required |
 | Gemma4 26B MoE | sdpa | liger | grouped_mm | **off** | Liger+compile incompatible |
-| Qwen3.5 35B MoE | fa3 | native | grouped_mm | **off** | FLA+TileLang, DeepEP, EP4+FSDP |
+| Qwen3.5 35B MoE | fa3 | native | grouped_mm | **off** | FLA+TileLang, DeepEP or native all-to-all, EP4+FSDP |
+
+`backend: native` is the default everywhere, including all example SFT
+configs under `configs/examples/`.
+
+## Measured throughput (8xH100, seq 2048, LoRA r32, production configs)
+
+| Model | tok/s | Peak GiB |
+|---|---|---|
+| qwen3-8b | 97.9k | 58 |
+| deepseek-r1-distill-llama-8b | 112k | 52 |
+| qwen3-14b | 58.2k | 60 |
+| qwen3-32b (DDP) | 17.7k | 65 |
+| gemma4-26b-a4b-it | 34.7k | 75 |
+| gemma4-31b-it | 11.5k | 64 |
+| olmo3-32b-think-dpo | 15.8k | 65 |
+| qwen3.5-35b-a3b (FSDP+EP4, native all-to-all) | 18.0k | 75 |
+
+Qwen3-32B under FSDP/HSDP: ~13.8k tok/s at 23-29 GiB (vs. DDP 17.7k/65 GiB) —
+prefer DDP when it fits, FSDP/HSDP when memory-bound.
+
+## Distributed correctness (verified)
+
+DDP, FSDP, HSDP, and FSDP/HSDP+expert-parallel all give every rank distinct
+data and per-step losses matching DDP within bf16 noise (Qwen3-8B, 20 steps:
+final loss 1.3598/1.3594/1.3594 for DDP/FSDP/HSDP; step-1 per-parameter
+gradients agree within 0.7%). LoRA init is seeded identically across ranks;
+per-rank seeds apply afterwards.
+
+MoE expert-parallel (Qwen3.5-35B-A3B): `moe_a2a_backend: native` is exact
+(bitwise-identical EP vs non-EP forward) and faster than `deepep` at EP4
+(18.0k vs 16.3k tok/s); `deepep` combines in bf16 (~2% drift over 4 layers).
+Production config uses `native`. Verify with:
+
+```bash
+torchrun --nproc-per-node 8 tests/multigpu/ep_gradcheck.py 4 native
+```
+
+## Model weights and caching
+
+`model.cache_dir` defaults to `None` — the standard HF hub cache
+(`$HF_HOME/hub`). Only set it explicitly if you need the flat
+`<cache_dir>/models--org--name` layout (note: **not** `<cache_dir>/hub/...`).
+Registry models resolve at their pinned revision; `HF_HUB_OFFLINE=1` inside
+the container fails loudly on a missing revision instead of downloading. An
+optional `TOOLKIT_WEIGHTS` env var can point at a flat dir of `<ModelName>/`
+weights instead, only used if set.
 
 ## Agent workflow
 
@@ -102,7 +168,10 @@ New models require a `ModelSpec` entry in `src/finetune_library/registry.py` —
    scripts/production/launch-one-node.sh <config.yaml> benchmark
    ```
 6. Monitor `<output_dir>/train.log`, `metrics.jsonl`, `events.jsonl`.
-7. `finetune-lib merge --checkpoint <output_dir>/final --output <output_dir>/merged`
+7. Merge: `scripts/run.sh _ merge --checkpoint <output_dir>/final --output <output_dir>/merged`
+   (or, outside Docker: `finetune-lib merge --checkpoint ... --output ...`).
+   Note `merge` takes `--checkpoint`/`--output`/`--device`/`--max-shard-size`/
+   `--validation-text`, not `--config`.
 
 ## SLURM
 
@@ -123,9 +192,18 @@ sbatch "${FINETUNE_LIBRARY_ROOT}/scripts/slurm/train-one-node.sh"
 | `summary.json` / `benchmark.json` | Final summary |
 | `final/` | BF16 PEFT adapter |
 
+## Opt-in knobs (off by default)
+
+- `distributed.reshard_after_forward`, `distributed.fsdp_prefetch_layers`,
+  `distributed.ddp_static_graph` — measured no win (or slower) on our
+  workloads.
+- `data.packing_isolation: attention` — requires `flash_attention_2`/`_3`
+  (padding-free varlen attention); ~4% slower on packed data but avoids
+  cross-document attention.
+
 ## Do not
 
-- Put production outputs in `toolkit/finetune-library/outputs/` (gitignored scratch).
+- Put production outputs in `outputs/` at the repo root (gitignored scratch).
 - Use `~/` for `HF_HOME` or model caches.
 - Enable `torch_compile` with Liger (skipped automatically; no benefit).
 - Use `compile_scope: blocks` with MoE `grouped_mm` (auto-downgraded to `loss_only`).
@@ -139,14 +217,14 @@ Minimum checklist:
 2. Loader branch in `runtime.py` if multimodal / non-standard.
 3. MoE expert class names in `lora.py` + `moe_parallel.py` if MoE.
 4. Liger wiring in `_apply_liger_kernels()` if using Liger.
-5. `configs/models/<name>-cpt.yaml` + smoke on 8×GPU.
+5. `configs/models/<name>-cpt.yaml` + smoke on 8xGPU.
 6. Benchmark before promoting to production defaults.
 
 ## Container publish
 
 ```bash
-cd /projects/data/llmteam/sidharth/toolkit
-bash containers/push_ghcr_finetune.sh
+cd "${FINETUNE_LIBRARY_ROOT}"
+PUSH_GHCR=1 scripts/build.sh 12.8-cu129
 ```
 
 Requires `docker login ghcr.io` with a GitHub PAT (`write:packages`).

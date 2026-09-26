@@ -11,7 +11,7 @@ data:
 training:
   output_dir: outputs/qwen3-8b-cpt
   max_seq_length: 2048
-  per_device_batch_size: 1
+  per_device_batch_size: 4
   gradient_accumulation_steps: 1
   max_steps: 10
   log_every_steps: 1
