@@ -225,7 +225,13 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
     events = EventLogger(output_dir, config.logging, rank=context.rank)
     tracking = TrackingSession(config, rank=context.rank)
     try:
-        _seed_everything(config.training.seed, context.rank)
+        # Seed every rank identically while the model and LoRA adapters are
+        # initialized. DDP would broadcast rank 0's parameters anyway, but
+        # FSDP2/HSDP/EP never broadcast: per-rank seeds there gave every shard
+        # and every replica a different LoRA init (HSDP replicas and
+        # FSDP-ignored replicated adapters then disagreed for the whole run).
+        # Per-rank seeds are restored below, before training starts.
+        _seed_everything(config.training.seed, 0)
         if config.precision.allow_tf32 and context.device.type == "cuda":
             torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -259,6 +265,7 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
         )
         if config.checkpoint.resume_from:
             load_adapter(peft_model, config.checkpoint.resume_from)
+        _seed_everything(config.training.seed, context.rank)
         if context.is_main:
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "lora_audit.json").write_text(

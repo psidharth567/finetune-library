@@ -18,10 +18,27 @@ def _trainable_parameters(model: nn.Module) -> list[nn.Parameter]:
 def _can_use_fused_adamw(parameters: list[nn.Parameter], requested: bool) -> bool:
     if not requested:
         return False
-    return all(
-        parameter.device.type == "cuda" and parameter.__class__.__name__ != "DTensor"
-        for parameter in parameters
-    )
+    # torch==2.11.0 (this project's pinned version) supports the fused AdamW
+    # kernel over DTensor params directly (verified: FSDP2-sharded DTensor
+    # params take the fused path and step without error, on both a single
+    # shard and multiple shards). Earlier torch releases raised for DTensor
+    # here, which is why this check originally excluded them; under FSDP2
+    # that meant optimizer.fused=True (the default) was silently downgraded
+    # to the foreach path. This restores fused=True actually taking effect.
+    if not all(parameter.device.type == "cuda" for parameter in parameters):
+        return False
+    # A single fused call requires every tensor in it to be the same kind
+    # ("aten._fused_adamw_.default: got mixed torch.Tensor and DTensor").
+    # build_optimizer splits mixed Tensor/DTensor parameters into separate,
+    # internally-homogeneous param groups before calling this, so by the
+    # time we get here `parameters` is one such homogeneous group and this
+    # check only needs to confirm it really is homogeneous.
+    from torch.distributed.tensor import DTensor
+
+    is_dtensor = [isinstance(parameter, DTensor) for parameter in parameters]
+    if any(is_dtensor) and not all(is_dtensor):
+        return False
+    return True
 
 
 def build_optimizer(model: nn.Module, config: OptimizerConfig, effective_lr: float | None = None) -> torch.optim.Optimizer:
@@ -38,6 +55,27 @@ def build_optimizer(model: nn.Module, config: OptimizerConfig, effective_lr: flo
         "weight_decay": config.weight_decay,
     }
     if config.name == OptimizerName.ADAMW:
+        from torch.distributed.tensor import DTensor
+
+        is_dtensor = [isinstance(parameter, DTensor) for parameter in parameters]
+        if config.fused and any(is_dtensor) and not all(is_dtensor):
+            # Mixed Tensor/DTensor params (EP+FSDP2: routed/shared-expert
+            # LoRA stays a plain local Tensor while the rest is sharded as
+            # DTensor). Split into two homogeneous param groups so each can
+            # still take the fused path internally, instead of downgrading
+            # every parameter in the model to the foreach path just because
+            # a handful of expert-adapter tensors are not DTensors.
+            dtensor_params = [p for p, flag in zip(parameters, is_dtensor) if flag]
+            plain_params = [p for p, flag in zip(parameters, is_dtensor) if not flag]
+            groups = [
+                {
+                    "params": group_params,
+                    "fused": _can_use_fused_adamw(group_params, config.fused),
+                }
+                for group_params in (dtensor_params, plain_params)
+                if group_params
+            ]
+            return torch.optim.AdamW(groups, **common)
         return torch.optim.AdamW(
             parameters,
             fused=_can_use_fused_adamw(parameters, config.fused),

@@ -67,6 +67,7 @@ def context() -> DistributedContext:
         strategy=DistributedStrategy.DDP,
         shard_size=1,
         replicate_size=1,
+        expert_parallel_size=1,
         data_parallel_rank=0,
         data_parallel_size=1,
     )

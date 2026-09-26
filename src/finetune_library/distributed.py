@@ -75,13 +75,20 @@ class DistributedContext:
                 dist.all_reduce(synchronized, group=self.data_parallel_group)
                 synchronized.div_(self.data_parallel_size)
                 parameter.grad.copy_(synchronized)
-        if self.dp_shard_size > 1 and self.dp_shard_group is not None:
+        if self.expert_parallel_size > 1 and self.ep_replicated_trainables:
+            # A local expert's gradient already sums the tokens of every rank
+            # in its EP group (via the all-to-all backward), each scaled by the
+            # per-rank loss normalization. Summing over the expert's replicas
+            # therefore covers every rank's tokens exactly once, and dividing
+            # by the full world size yields the same mean as DDP. (Dividing by
+            # the replica count alone over-scaled expert grads by ep_size.)
             for parameter in self.ep_replicated_trainables:
                 if parameter.grad is None:
                     continue
                 synchronized = parameter.grad.contiguous()
-                dist.all_reduce(synchronized, group=self.dp_shard_group)
-                synchronized.div_(self.dp_shard_size)
+                if self.dp_shard_size > 1 and self.dp_shard_group is not None:
+                    dist.all_reduce(synchronized, group=self.dp_shard_group)
+                synchronized.div_(self.world_size)
                 parameter.grad.copy_(synchronized)
 
     @torch.no_grad()
@@ -92,6 +99,17 @@ class DistributedContext:
     ) -> torch.Tensor:
         """Clip mixed local and FSDP2 gradients with one multi-tensor pass."""
 
+        # Local (non-DTensor) gradients are replicated over different groups
+        # depending on which FSDP-ignored bucket the parameter falls into:
+        # ep_replicated_trainables (routed/shared-expert LoRA, ignored by
+        # fully_shard) are only replicated across dp_shard_size ranks per ep
+        # coordinate, *not* the whole world -- using world_size there (as
+        # this used to, unconditionally) understates their gradient-norm
+        # contribution whenever expert_parallel_size > 1. Every other local
+        # gradient (plain DDP, or replicated_trainables/tied adapters, which
+        # data_parallel_group now spans the full world) is replicated over
+        # the whole world.
+        ep_replicated_ids = {id(parameter) for parameter in self.ep_replicated_trainables}
         local_gradients: list[torch.Tensor] = []
         replication_factors: list[int] = []
         for parameter in parameters:
@@ -107,7 +125,10 @@ class DistributedContext:
                         factor *= int(mesh.size(dimension))
             else:
                 local = gradient
-                factor = self.world_size if self.distributed else 1
+                if id(parameter) in ep_replicated_ids and self.dp_shard_size > 1:
+                    factor = self.dp_shard_size
+                else:
+                    factor = self.world_size if self.distributed else 1
             local_gradients.append(local)
             replication_factors.append(factor)
 
@@ -203,6 +224,20 @@ def initialize_distributed(
                 "world_size must equal dense_parallel_size * expert_parallel_size, "
                 f"got {world_size} and ep={expert_parallel_size}"
             )
+        # Every rank consumes distinct data under FSDP/HSDP, with or without
+        # EP: data_rank/data_size/data_group always describe the full dense
+        # world (identical to DDP). FSDP2's own reduce-scatter/all-reduce
+        # over `dense_mesh` (below) provides the gradient averaging that
+        # replaces DDP's ring all-reduce, so the *sampler* partition and the
+        # *gradient averaging* group must span the same set of ranks -- the
+        # whole world -- for the update to match DDP's mean over the same
+        # global batch. (Previously this branch pinned data_rank/data_size to
+        # 0/1 -- or, for HSDP, to the replicate dimension only -- which made
+        # shard-group ranks silently train on the same batch; see
+        # DistributedContext.sync_replicated_gradients for the FSDP-ignored
+        # tied-adapter parameters, which still need an explicit all-reduce
+        # because fully_shard never sees them.)
+        data_rank, data_size = rank, world_size
         if strategy == DistributedStrategy.FSDP:
             if dense_world < 1:
                 raise ValueError("fsdp requires at least one dense parallel rank")
@@ -210,21 +245,32 @@ def initialize_distributed(
                 raise ValueError("fsdp requires torchrun with at least two processes")
             shard_size, replicate_size = dense_world, 1
             if expert_parallel_size > 1:
+                # Dense (non-expert) params are sharded on dp_shard alone but
+                # must be *replicated* (and therefore gradient-averaged) over
+                # the ep dimension too, since ep ranks now see different
+                # tokens. torch 2.11's DeviceMesh.__getitem__ can only select
+                # dims in their *original creation order* (it raises "Mesh
+                # dim indices should be in ascending order" otherwise, despite
+                # its own docstring example implying free reordering --
+                # confirmed empirically, not just from the docstring), so the
+                # mesh is built directly in (ep, dp_shard) order -- dim0 (ep)
+                # an implicit all-reduce/replicate dimension, dim1 (dp_shard)
+                # sharded -- rather than created as (dp_shard, ep) and
+                # reordered after the fact. fully_shard then reads this
+                # exactly like a 2D HSDP mesh, so the reduce-scatter +
+                # all-reduce together average over all `world_size` ranks,
+                # matching DDP.
                 mesh = init_device_mesh(
                     device.type,
-                    (dense_world, expert_parallel_size),
-                    mesh_dim_names=("dp_shard", "ep"),
+                    (expert_parallel_size, dense_world),
+                    mesh_dim_names=("ep", "dp_shard"),
                 )
-                dense_mesh = mesh["dp_shard"]
+                dense_mesh = mesh
                 dp_shard_group = mesh.get_group("dp_shard")
                 dp_shard_size = mesh["dp_shard"].size()
-                data_group = None
-                data_rank, data_size = 0, 1
             else:
                 mesh = init_device_mesh(device.type, (dense_world,), mesh_dim_names=("dp_shard",))
                 dense_mesh = mesh
-                data_group = None
-                data_rank, data_size = 0, 1
         else:
             shard_size = config.shard_size or spec.shard_size
             replicate_size = config.replicate_size or spec.replicate_size
@@ -238,17 +284,50 @@ def initialize_distributed(
             if shard_size > 8:
                 raise ValueError("HSDP shard groups must remain within one 8-GPU NVSwitch node")
             if expert_parallel_size > 1:
+                # Mesh dims are created (dp_replicate, ep, dp_shard) -- with
+                # dp_replicate and ep *adjacent* -- rather than the more
+                # "natural" (dp_replicate, dp_shard, ep), because torch
+                # 2.11's DeviceMesh._flatten only supports flattening
+                # adjacent, contiguous-stride dims (confirmed empirically);
+                # dp_replicate and dp_shard alone, skipping over ep, are not
+                # adjacent and cannot be flattened this way.
                 mesh = init_device_mesh(
                     device.type,
-                    (replicate_size, shard_size, expert_parallel_size),
-                    mesh_dim_names=("dp_replicate", "dp_shard", "ep"),
+                    (replicate_size, expert_parallel_size, shard_size),
+                    mesh_dim_names=("dp_replicate", "ep", "dp_shard"),
                 )
-                dense_mesh = mesh["dp_replicate", "dp_shard"]
-                dp_shard_group = mesh.get_group("dp_shard")
-                dp_shard_size = mesh["dp_shard"].size()
-                data_group = mesh["dp_replicate"].get_group()
-                data_rank = mesh.get_coordinate()[0]
-                data_size = replicate_size
+                # Dense params must be replicated (and averaged) over both
+                # dp_replicate and ep, sharded over dp_shard only. fully_shard
+                # only understands a 2D (replicate, shard) mesh, so flatten
+                # the two (now-adjacent) replicate dimensions into one before
+                # combining with dp_shard -- the same pattern used for
+                # HSDP+CP elsewhere (e.g. torchtitan).
+                mesh["dp_replicate", "ep"]._flatten("dp_replicate_ep")
+                dense_mesh = mesh["dp_replicate_ep", "dp_shard"]
+                # Expert-adapter parameters are ignored by fully_shard, so
+                # each ep-coordinate's copy is replicated verbatim across
+                # *both* dp_replicate and dp_shard; the manual all-reduce in
+                # sync_replicated_gradients must therefore cover that full
+                # group. dp_replicate and dp_shard are not adjacent in this
+                # mesh (ep sits between them), so DeviceMesh cannot flatten
+                # them directly -- build the group explicitly instead, with
+                # the same rank arithmetic every rank computes identically
+                # and in the same enumeration order (required so every rank
+                # makes the same sequence of dist.new_group calls).
+                ep_coordinate = (rank // shard_size) % expert_parallel_size
+                dp_shard_group = None
+                for ep_index in range(expert_parallel_size):
+                    ranks = [
+                        dp_replicate_index * (expert_parallel_size * shard_size)
+                        + ep_index * shard_size
+                        + dp_shard_index
+                        for dp_replicate_index in range(replicate_size)
+                        for dp_shard_index in range(shard_size)
+                    ]
+                    group = dist.new_group(ranks)
+                    if ep_index == ep_coordinate:
+                        dp_shard_group = group
+                dp_shard_size = replicate_size * shard_size
             else:
                 mesh = init_device_mesh(
                     device.type,
@@ -256,8 +335,6 @@ def initialize_distributed(
                     mesh_dim_names=("dp_replicate", "dp_shard"),
                 )
                 dense_mesh = mesh
-                data_group = mesh["dp_replicate"].get_group()
-                data_rank, data_size = rank // shard_size, replicate_size
     else:
         raise AssertionError(f"unhandled distributed strategy {strategy}")
 
@@ -299,7 +376,7 @@ def wrap_model(
     if context.world_size == 1:
         return model
     if context.strategy == DistributedStrategy.DDP:
-        return DistributedDataParallel(
+        ddp_model = DistributedDataParallel(
             model,
             device_ids=[context.local_rank] if context.device.type == "cuda" else None,
             output_device=context.local_rank if context.device.type == "cuda" else None,
@@ -307,6 +384,9 @@ def wrap_model(
             find_unused_parameters=False,
             gradient_as_bucket_view=True,
         )
+        if config.ddp_static_graph:
+            ddp_model._set_static_graph()
+        return ddp_model
 
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
@@ -335,6 +415,11 @@ def wrap_model(
     layers = [module for module in model.modules() if module.__class__.__name__ == spec.layer_class]
     if not layers:
         raise RuntimeError(f"could not find transformer layers named {spec.layer_class}")
+    # None reproduces the original hardcoded True for per-layer units.
+    layer_reshard_after_forward = (
+        True if config.reshard_after_forward is None else config.reshard_after_forward
+    )
+    shard_units: list[nn.Module] = []
     for layer in layers:
         layer_parameters = set(layer.parameters())
         layer_ignored = ignored.intersection(layer_parameters)
@@ -348,9 +433,10 @@ def wrap_model(
                 unit,
                 mesh=shard_mesh,
                 mp_policy=policy,
-                reshard_after_forward=True,
+                reshard_after_forward=layer_reshard_after_forward,
                 ignored_params=unit_ignored or None,
             )
+            shard_units.append(unit)
     fully_shard(
         model,
         mesh=shard_mesh,
@@ -361,7 +447,27 @@ def wrap_model(
         reshard_after_forward=False,
         ignored_params=ignored or None,
     )
+    if config.fsdp_prefetch_layers > 0:
+        _install_fsdp_prefetch(shard_units, config.fsdp_prefetch_layers)
     return model
+
+
+def _install_fsdp_prefetch(shard_units: list[nn.Module], depth: int) -> None:
+    """Opt-in explicit forward/backward prefetch across FSDP2 shard units.
+
+    Each unit is hinted to prefetch the all-gather of the next `depth` units
+    in the forward order (and the previous `depth` units in the reverse,
+    backward order), overlapping communication with compute instead of
+    relying on FSDP2's implicit one-step-ahead prefetch.
+    """
+
+    for index, unit in enumerate(shard_units):
+        forward_targets = shard_units[index + 1 : index + 1 + depth]
+        if forward_targets:
+            unit.set_modules_to_forward_prefetch(forward_targets)
+        backward_targets = shard_units[max(0, index - depth) : index][::-1]
+        if backward_targets:
+            unit.set_modules_to_backward_prefetch(backward_targets)
 
 
 def _noncontiguous_storage_groups(model: nn.Module) -> set[nn.Parameter]:

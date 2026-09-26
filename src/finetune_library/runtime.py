@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,10 +28,16 @@ class LoadedRuntime:
     model_kernels: str = "native"
 
 
+def apply_chat_template_override(tokenizer: Any, config: ExperimentConfig) -> None:
+    override = config.model.chat_template
+    if override is not None:
+        tokenizer.chat_template = override
+
+
 def _cached_snapshot(
     repo_id: str,
     revision: str,
-    cache_dir: str,
+    cache_dir: str | None,
 ) -> str | None:
     try:
         from huggingface_hub import try_to_load_from_cache
@@ -75,7 +82,7 @@ def _apply_liger_kernels(model: nn.Module, spec: ModelSpec) -> None:
         liger.apply_liger_kernel_to_qwen3(rope=True, swiglu=True, **common)
     elif spec.key == "deepseek-r1-distill-llama-8b":
         liger.apply_liger_kernel_to_llama(rope=True, swiglu=True, **common)
-    elif spec.key == "olmo3-32b-think-dpo":
+    elif spec.key.startswith("olmo3-"):
         liger.apply_liger_kernel_to_olmo3(rope=True, swiglu=True, **common)
     elif spec.key.startswith("qwen3.5-"):
         if spec.moe:
@@ -131,23 +138,20 @@ def _load_native(
         )
         if cached_snapshot is not None:
             snap = Path(cached_snapshot)
-            has_weights = any(snap.glob("model*.safetensors")) or (snap / "pytorch_model.bin").exists() or (snap / "model.safetensors").exists()
+            has_weights = (
+                any(snap.glob("model*.safetensors"))
+                or (snap / "pytorch_model.bin").exists()
+            )
             if not has_weights:
-                import os
-                toolkit_weights = os.environ.get("TOOLKIT_WEIGHTS", "/projects/data/llmteam/sidharth/toolkit/weights")
-                for cand in [Path(toolkit_weights) / "Qwen3-8B", Path(toolkit_weights) / spec.repo_id.split("/")[-1]]:
-                    if cand.exists() and any(cand.glob("model*.safetensors")):
-                        cached_snapshot = str(cand)
-                        break
-                else:
-                    cached_snapshot = None
-        else:
-            import os
-            toolkit_weights = os.environ.get("TOOLKIT_WEIGHTS", "/projects/data/llmteam/sidharth/toolkit/weights")
-            for cand in [Path(toolkit_weights) / spec.repo_id.split("/")[-1]]:
+                cached_snapshot = None
+        if cached_snapshot is None:
+            # Optional flat local-weights directory (e.g. /weights/<ModelName>),
+            # used only when TOOLKIT_WEIGHTS is set explicitly.
+            toolkit_weights = os.environ.get("TOOLKIT_WEIGHTS")
+            if toolkit_weights:
+                cand = Path(toolkit_weights) / spec.repo_id.split("/")[-1]
                 if cand.exists() and any(cand.glob("model*.safetensors")):
                     cached_snapshot = str(cand)
-                    break
         model_source = cached_snapshot or spec.repo_id
         tokenizer_kwargs: dict[str, Any] = {
             "revision": revision,
@@ -163,6 +167,7 @@ def _load_native(
             spec.repo_id,
             **tokenizer_kwargs,
         )
+        apply_chat_template_override(tokenizer, config)
         if tokenizer.pad_token_id is None:
             if tokenizer.eos_token_id is None:
                 raise ValueError("tokenizer defines neither pad_token_id nor eos_token_id")
@@ -201,8 +206,8 @@ def _load_native(
                 ),
             )
             cast(Any, model).tie_weights()
-        elif spec.text_only and spec.key.startswith("qwen3.5-"):
-            from transformers import Qwen3_5MoeForCausalLM
+        elif spec.text_only and spec.key.startswith("gemma3-"):
+            from transformers import Gemma3ForCausalLM
 
             root_config = AutoConfig.from_pretrained(
                 model_source,
@@ -214,7 +219,29 @@ def _load_native(
             text_config.use_cache = config.runtime.use_cache
             model = cast(
                 nn.Module,
-                Qwen3_5MoeForCausalLM.from_pretrained(
+                Gemma3ForCausalLM.from_pretrained(
+                    model_source,
+                    config=text_config,
+                    key_mapping={"language_model.model.": "model."},
+                    **common,
+                ),
+            )
+            cast(Any, model).tie_weights()
+        elif spec.text_only and spec.key.startswith("qwen3.5-"):
+            from transformers import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
+
+            causal_cls = Qwen3_5MoeForCausalLM if spec.moe else Qwen3_5ForCausalLM
+            root_config = AutoConfig.from_pretrained(
+                model_source,
+                revision=revision,
+                cache_dir=config.model.cache_dir,
+                trust_remote_code=config.model.trust_remote_code,
+            )
+            text_config = root_config.get_text_config()
+            text_config.use_cache = config.runtime.use_cache
+            model = cast(
+                nn.Module,
+                causal_cls.from_pretrained(
                     model_source,
                     config=text_config,
                     **common,
@@ -264,6 +291,7 @@ def _load_unsloth(
         # exist, invalidating a like-for-like benchmark.
         use_exact_model_name=True,
     )
+    apply_chat_template_override(tokenizer, config)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer

@@ -499,6 +499,7 @@ def cache_key(config: ExperimentConfig, tokenizer: Any) -> str:
         "max_seq_length": config.training.max_seq_length,
         "tokenizer": getattr(tokenizer, "name_or_path", tokenizer.__class__.__name__),
         "tokenizer_revision": config.model.revision or spec.revision,
+        "chat_template_override": config.model.chat_template,
         "tokenizer_commit": getattr(tokenizer, "init_kwargs", {}).get("_commit_hash"),
         "tokenizer_vocab_size": len(tokenizer),
     }
@@ -620,7 +621,47 @@ class CausalCollator:
         self.pad_to_multiple_of = pad_to_multiple_of
         self.packing_isolation = packing_isolation
 
+    def _flatten_isolated(self, rows: list[Mapping[str, Sequence[int]]]) -> dict[str, torch.Tensor]:
+        """Padding-free varlen batch: rows concatenated into one sequence.
+
+        Document boundaries are encoded purely by ``position_ids`` resetting to
+        0, which Transformers' flash-attention path turns into ``cu_seqlens``
+        (``_is_packed_sequence`` -> ``prepare_fa_kwargs_from_position_ids``).
+        No 4-D mask is built, so attention stays on the varlen flash kernel and
+        collation is O(tokens). A window that starts mid-document is rebased so
+        its leading segment also starts at 0. The label at every segment start
+        is ignored so the shifted next-token loss never predicts across
+        documents.
+        """
+        flat_ids: list[int] = []
+        flat_labels: list[int] = []
+        flat_pos: list[int] = []
+        for row in rows:
+            ids = [int(t) for t in row["input_ids"][: self.max_length]]
+            labels = [int(t) for t in row["labels"][: self.max_length]]
+            raw_pos = row.get("position_ids")
+            pos = [int(p) for p in raw_pos[: len(ids)]] if raw_pos is not None else list(range(len(ids)))
+            if pos and pos[0] != 0:
+                offset = pos[0]
+                index = 0
+                while index < len(pos) and pos[index] == offset + index:
+                    pos[index] -= offset
+                    index += 1
+            for index, p in enumerate(pos):
+                if p == 0:
+                    labels[index] = IGNORE_INDEX
+            flat_ids.extend(ids)
+            flat_labels.extend(labels)
+            flat_pos.extend(pos)
+        return {
+            "input_ids": torch.tensor([flat_ids], dtype=torch.long),
+            "labels": torch.tensor([flat_labels], dtype=torch.long),
+            "position_ids": torch.tensor([flat_pos], dtype=torch.long),
+        }
+
     def __call__(self, rows: list[Mapping[str, Sequence[int]]]) -> dict[str, torch.Tensor]:
+        if self.packing_isolation == "attention":
+            return self._flatten_isolated(rows)
         longest = min(max(len(row["input_ids"]) for row in rows), self.max_length)
         target = min(
             self.max_length,
@@ -632,7 +673,6 @@ class CausalCollator:
         masks: list[list[int]] = []
         position_ids_list: list[list[int]] = []
         has_position = any("position_ids" in row for row in rows)
-        has_segment = any("segment_ids" in row for row in rows)
 
         for row in rows:
             ids = [int(token) for token in row["input_ids"][:target]]
@@ -654,47 +694,6 @@ class CausalCollator:
         }
         if has_position:
             batch["position_ids"] = torch.tensor(position_ids_list, dtype=torch.long)
-            if has_segment and self.packing_isolation == "attention":
-                # Build 4D block-diagonal causal mask
-                # Shape: [B, 1, L, L] with 1 for allowed, 0 for masked (for SDPA, we need bool or float)
-                # SDPA expects attention_mask as bool or float; we will produce attention_mask 4D
-                # But HF transformers expects attention_mask as [B, L] or [B, 1, L, L] float with 0 for keep, -inf for mask
-                # To keep compatibility, we will produce a custom 4D mask and override the 2D mask
-                # We'll construct a bool mask where True=allow
-                B = len(rows)
-                L = target
-                # Build per-sample segment ids padded
-                seg_tensors = []
-                for row in rows:
-                    seg = [int(x) for x in row.get("segment_ids", [1]*len(row["input_ids"]))[:target]]
-                    seg = seg + [0] * (target - len(seg))
-                    seg_tensors.append(seg)
-                seg_tensor = torch.tensor(seg_tensors, dtype=torch.long)  # [B, L]
-                # Create causal + segment mask: position j can attend to i iff i<=j and seg[i]==seg[j] and mask[i]==1 and mask[j]==1
-                # We build a float mask with 0 for allowed, -inf for blocked (as HF does)
-                # For now return as attention_mask 4D float, and also keep padding mask
-                # We'll encode as [B, L, L] bool then expand
-                att_4d = torch.zeros((B, 1, L, L), dtype=torch.float32)
-                for b in range(B):
-                    for i in range(L):
-                        for j in range(L):
-                            # j is query, i is key (j attends to i)
-                            if i > j:
-                                att_4d[b, 0, j, i] = float("-inf")
-                            elif seg_tensor[b, i] == 0 or seg_tensor[b, j] == 0:
-                                # padded position
-                                att_4d[b, 0, j, i] = float("-inf")
-                            elif seg_tensor[b, i] != seg_tensor[b, j]:
-                                att_4d[b, 0, j, i] = float("-inf")
-                            elif masks[b][i] == 0:
-                                att_4d[b, 0, j, i] = float("-inf")
-                            else:
-                                att_4d[b, 0, j, i] = 0.0
-                # HF will handle this as attention_mask; we need to ensure it is passed correctly
-                # For compatibility, we keep the 2D mask for padding but also provide 4D
-                # We'll store under attention_mask_4d and let trainer decide; but to avoid breaking
-                # existing code, we replace attention_mask with 4D if isolation is on
-                batch["attention_mask"] = att_4d
         return batch
 
 

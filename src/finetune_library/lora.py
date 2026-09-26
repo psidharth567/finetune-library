@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from collections import Counter
 from dataclasses import dataclass
@@ -13,7 +14,8 @@ from finetune_library.config import LoraSettings
 from finetune_library.moe_parallel import MoeA2ABackend, MoeParallelLayout, expert_parallel_forward
 from finetune_library.registry import ModelSpec
 
-EXPERT_LAYER_NAMES = frozenset({"Gemma4TextExperts", "Qwen3_5MoeExperts"})
+EXPERT_LAYER_NAMES = frozenset({"Gemma4TextExperts", "Qwen3_5MoeExperts", "Qwen3MoeExperts"})
+_DEBUG_EXPERT_IDS = os.environ.get("FINETUNE_DEBUG_EXPERT_IDS", "0") == "1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +165,10 @@ def _grouped_local_expert_compute(
     if hidden_states.numel() == 0:
         return hidden_states
     local_expert_ids = expert_ids - global_offset
-    if torch.any(local_expert_ids < 0) or torch.any(local_expert_ids >= base.num_experts):
+    if _DEBUG_EXPERT_IDS and (
+        torch.any(local_expert_ids < 0) or torch.any(local_expert_ids >= base.num_experts)
+    ):
+        # Two host syncs per MoE layer; only worth paying when debugging routing.
         raise RuntimeError(
             "received expert ids outside the local shard: "
             f"min={int(local_expert_ids.min())} max={int(local_expert_ids.max())} "

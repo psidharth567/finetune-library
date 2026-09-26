@@ -50,8 +50,18 @@ class ModelConfig(StrictModel):
         default=None,
         description="Explicit revision override; registry models otherwise use their pinned commit",
     )
-    cache_dir: str = ".cache/huggingface"
+    # None = standard Hugging Face hub cache ($HF_HUB_CACHE, i.e. $HF_HOME/hub).
+    # An explicit value is passed as the hub cache dir (directory holding models--*).
+    cache_dir: str | None = None
     trust_remote_code: bool = False
+    chat_template: str | None = Field(
+        default=None,
+        description=(
+            "Jinja chat template overriding the tokenizer's own (e.g. plain ChatML "
+            "to disable Qwen3 thinking blocks in training targets). None keeps the "
+            "tokenizer template."
+        ),
+    )
 
 
 class DataConfig(StrictModel):
@@ -147,6 +157,19 @@ class DistributedConfig(StrictModel):
     replicate_size: PositiveInt | None = None
     expert_parallel_size: PositiveInt = 1
     reduce_dtype: Literal["bfloat16", "float32"] = "bfloat16"
+    # None reproduces current behaviour byte-for-byte: per-layer units reshard
+    # eagerly after forward (reshard_after_forward=True) while the root module
+    # keeps its all-gathered params through backward (reshard_after_forward=False).
+    # Setting this explicitly overrides the per-layer unit value only; the root
+    # module is always kept at reshard_after_forward=False regardless.
+    reshard_after_forward: bool | None = None
+    # Opt-in FSDP2 forward/backward prefetch depth for decoder-layer shard
+    # units. 0 (default) reproduces current behaviour: no explicit prefetch
+    # hints are installed, so FSDP2 falls back to its implicit prefetch.
+    fsdp_prefetch_layers: Annotated[int, Field(ge=0)] = 0
+    # Opt-in DDP static_graph. False (default) reproduces current behaviour.
+    # Only meaningful for strategy=ddp; ignored otherwise.
+    ddp_static_graph: bool = False
 
     @model_validator(mode="after")
     def validate_mesh(self) -> DistributedConfig:
@@ -178,7 +201,7 @@ class RuntimeConfig(StrictModel):
     torch_compile: bool = False
     compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "default"
     compile_scope: Literal["full", "loss_only", "blocks"] = "full"
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool = False
     use_cache: bool = False
     verbose_lora_audit: bool = False
 
@@ -258,6 +281,14 @@ class ExperimentConfig(StrictModel):
             )
         if self.data.default_max_length is not None and self.data.length_policy == "global":
             raise ValueError("data.default_max_length requires length_policy != global")
+        if self.data.packing_isolation == "attention" and self.runtime.attention not in (
+            "flash_attention_2",
+            "flash_attention_3",
+        ):
+            raise ValueError(
+                "data.packing_isolation=attention uses padding-free varlen attention driven by "
+                "position_ids; set runtime.attention to flash_attention_2 or flash_attention_3"
+            )
         return self
 
     def effective_learning_rate(self) -> float:

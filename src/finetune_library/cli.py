@@ -95,6 +95,9 @@ def main(argv: list[str] | None = None) -> int:
             cache_dir=config.model.cache_dir,
             trust_remote_code=config.model.trust_remote_code,
         )
+        from finetune_library.runtime import apply_chat_template_override
+
+        apply_chat_template_override(tokenizer, config)
         output = prepare_to_disk(config, tokenizer, args.output)
         print(output)
         return 0

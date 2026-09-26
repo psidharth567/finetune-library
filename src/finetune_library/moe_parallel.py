@@ -8,7 +8,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.autograd import Function
-from torch.nn import functional as F
 
 EXPERT_MODULE_NAMES = frozenset({"Gemma4TextExperts", "Qwen3_5MoeExperts"})
 EXPERT_WRAPPER_NAMES = frozenset({"GroupedGemmaExpertWrapper", "EagerGemmaExpertWrapper"})
@@ -157,7 +156,13 @@ class _AllToAllTokens(Function):
         )
 
     @staticmethod
-    def backward(ctx: Any, grad_hidden: torch.Tensor, *_: Any) -> tuple[torch.Tensor | None, ...]:
+    def backward(
+        ctx: Any,
+        grad_hidden: torch.Tensor,
+        _grad_expert_ids: Any,
+        grad_recv_weights: torch.Tensor | None,
+        *_: Any,
+    ) -> tuple[torch.Tensor | None, ...]:
         split_grad = list(torch.split(grad_hidden, ctx.recv_sizes, dim=0))
         recv_grad = [
             grad_hidden.new_zeros((size, ctx.hidden_dim)) for size in ctx.input_split_sizes
@@ -167,7 +172,21 @@ class _AllToAllTokens(Function):
         sorted_grad = torch.cat(recv_grad, dim=0) if recv_grad else grad_hidden.new_zeros(0, ctx.hidden_dim)
         grad_out = grad_hidden.new_zeros(ctx.num_tokens, ctx.hidden_dim)
         grad_out.index_add_(0, ctx.token_ids[ctx.perm], sorted_grad)
-        return grad_out, None, None, None, None, None, None
+        # Routing weights are applied on the expert rank, so their gradient
+        # (and through it the router/softmax path into the hidden states)
+        # must travel back to the source rank as well.
+        grad_weights = None
+        if grad_recv_weights is not None and ctx.needs_input_grad[3]:
+            split_weight_grad = list(torch.split(grad_recv_weights.contiguous(), ctx.recv_sizes, dim=0))
+            recv_weight_grad = [
+                grad_recv_weights.new_zeros(size) for size in ctx.input_split_sizes
+            ]
+            if split_weight_grad:
+                dist.all_to_all(recv_weight_grad, split_weight_grad, group=ctx.ep_group)
+            sorted_weight_grad = torch.cat(recv_weight_grad, dim=0)
+            grad_weights = torch.empty_like(sorted_weight_grad)
+            grad_weights[ctx.perm] = sorted_weight_grad
+        return grad_out, None, None, grad_weights, None, None, None
 
 
 class _CombineExpertOutputs(Function):
@@ -184,15 +203,28 @@ class _CombineExpertOutputs(Function):
         original_token_ids: torch.Tensor,
         num_tokens: int,
         hidden_dim: int,
+        expert_ids: torch.Tensor,
     ) -> torch.Tensor:
         split_output = list(torch.split(expert_output, recv_sizes, dim=0))
         recv_output = [expert_output.new_zeros(size, hidden_dim) for size in input_split_sizes]
         dist.all_to_all(recv_output, split_output, group=ep_group)
         sorted_output = torch.cat(recv_output, dim=0) if recv_output else expert_output.new_zeros(0, hidden_dim)
         # Local expert kernels already apply routing weights; only route outputs
-        # back to their source tokens here.
-        final = expert_output.new_zeros(num_tokens, hidden_dim)
-        final.index_add_(0, original_token_ids[perm], sorted_output.to(final.dtype))
+        # back to their source tokens here. Assignment a = token * top_k + k, so
+        # un-permuting and summing over k is a fixed-order (deterministic)
+        # reduction. An atomic index_add_ here made gradient-checkpoint
+        # recomputation differ from the original forward, which could flip
+        # near-tie routing decisions in later layers.
+        assignment_output = torch.empty_like(sorted_output)
+        assignment_output[perm] = sorted_output
+        per_slot = assignment_output.view(num_tokens, -1, hidden_dim)
+        # Accumulate in ascending expert order, exactly like the non-EP grouped
+        # path, so EP and non-EP forwards are bitwise identical.
+        expert_order = torch.argsort(expert_ids.view(num_tokens, -1), dim=-1)
+        per_slot = per_slot.gather(1, expert_order.unsqueeze(-1).expand(-1, -1, hidden_dim))
+        final = torch.zeros_like(per_slot[:, 0])
+        for slot in range(per_slot.shape[1]):
+            final.add_(per_slot[:, slot])
         ctx.ep_group = ep_group
         ctx.input_split_sizes = input_split_sizes
         ctx.recv_sizes = recv_sizes
@@ -208,7 +240,7 @@ class _CombineExpertOutputs(Function):
         recv_grad = [sorted_grad.new_zeros(size, grad_final.shape[-1]) for size in ctx.recv_sizes]
         dist.all_to_all(recv_grad, split_grad, group=ctx.ep_group)
         expert_grad = torch.cat(recv_grad, dim=0) if recv_grad else sorted_grad.new_zeros(0, grad_final.shape[-1])
-        return expert_grad, None, None, None, None, None, None, None, None, None
+        return expert_grad, None, None, None, None, None, None, None, None, None, None
 
 
 _deepep_buffer: Any = None
@@ -271,12 +303,17 @@ def _flatten_deepep_assignments(
 
 def _scatter_deepep_assignments(
     expert_output: torch.Tensor,
-    token_indices: torch.Tensor,
+    valid_mask: torch.Tensor,
     num_tokens: int,
 ) -> torch.Tensor:
-    output = expert_output.new_zeros(num_tokens, expert_output.shape[-1])
-    output.index_add_(0, token_indices, expert_output.to(output.dtype))
-    return output
+    """Sum each received token's local top-k expert outputs in slot order.
+
+    Fixed-order reduction (rather than an atomic index_add_) keeps gradient
+    checkpoint recomputation bitwise identical to the original forward.
+    """
+    per_slot = expert_output.new_zeros(num_tokens, valid_mask.shape[-1], expert_output.shape[-1])
+    per_slot[valid_mask] = expert_output
+    return per_slot.sum(dim=1)
 
 
 class _DeepEPDispatch(Function):
@@ -318,19 +355,42 @@ class _DeepEPDispatch(Function):
         ctx.buffer = buffer
         ctx.handle = handle
         ctx.input_dtype = hidden_states.dtype
+        ctx.weights_dtype = topk_weights.dtype
+        ctx.recv_shape = tuple(recv_hidden.shape)
         return recv_hidden, recv_topk_ids, recv_topk_weights, handle
 
     @staticmethod
-    def backward(ctx: Any, grad_recv_hidden: torch.Tensor, *_: Any) -> tuple[torch.Tensor | None, ...]:
+    def backward(
+        ctx: Any,
+        grad_recv_hidden: torch.Tensor | None,
+        _grad_recv_ids: Any,
+        grad_recv_weights: torch.Tensor | None,
+        *_: Any,
+    ) -> tuple[torch.Tensor | None, ...]:
+        if grad_recv_hidden is None and grad_recv_weights is None:
+            return None, None, None, None, None
         if grad_recv_hidden is None:
-            return None, None, None, None, None, None
-        combined_grad, _, _ = ctx.buffer.combine(
+            grad_recv_hidden = torch.zeros(
+                ctx.recv_shape, device=grad_recv_weights.device, dtype=torch.bfloat16
+            )
+        # Routing weights are applied on the expert rank; DeepEP's combine
+        # reduces the per-assignment weight gradients back to the source
+        # token's top-k slots (same pattern as Megatron's DeepEP dispatcher).
+        combined_grad, combined_weight_grad, _ = ctx.buffer.combine(
             grad_recv_hidden.contiguous(),
             ctx.handle,
+            topk_weights=(
+                grad_recv_weights.to(torch.float32).contiguous()
+                if grad_recv_weights is not None and ctx.needs_input_grad[2]
+                else None
+            ),
             async_finish=False,
         )
         grad_hidden = combined_grad.to(ctx.input_dtype)
-        return grad_hidden, None, None, None, None
+        grad_weights = None
+        if combined_weight_grad is not None and ctx.needs_input_grad[2]:
+            grad_weights = combined_weight_grad.to(ctx.weights_dtype)
+        return grad_hidden, None, grad_weights, None, None
 
 
 class _DeepEPCombine(Function):
@@ -376,53 +436,11 @@ def expert_parallel_forward_deepep(
     local_output = local_forward(flat_hidden, flat_ids, flat_weights)
     per_token_output = _scatter_deepep_assignments(
         local_output,
-        token_indices,
+        recv_expert_ids >= 0,
         recv_hidden.shape[0],
     )
     combined = _DeepEPCombine.apply(per_token_output.to(torch.bfloat16), buffer, handle)
     return combined.to(hidden_states.dtype)
-
-
-def _local_grouped_experts_forward(
-    hidden_states: torch.Tensor,
-    gate_up_proj: torch.Tensor,
-    down_proj: torch.Tensor,
-    expert_ids: torch.Tensor,
-    weights: torch.Tensor,
-    act_fn: Callable[[torch.Tensor], torch.Tensor],
-    global_offset: int,
-) -> torch.Tensor:
-    if hidden_states.numel() == 0:
-        return hidden_states
-    local_expert_ids = expert_ids - global_offset
-    if torch.any(local_expert_ids < 0) or torch.any(local_expert_ids >= gate_up_proj.shape[0]):
-        raise RuntimeError(
-            "received expert ids outside the local shard: "
-            f"min={int(local_expert_ids.min())} max={int(local_expert_ids.max())} "
-            f"local={gate_up_proj.shape[0]}"
-        )
-    permutation = torch.argsort(local_expert_ids)
-    inverse = torch.empty_like(permutation)
-    inverse[permutation] = torch.arange(permutation.numel(), device=hidden_states.device)
-    sorted_experts = local_expert_ids[permutation]
-    sorted_hidden = hidden_states[permutation]
-    counts = torch.bincount(sorted_experts, minlength=gate_up_proj.shape[0])
-    offsets = counts.cumsum(0, dtype=torch.int32)
-    gate_up = torch._grouped_mm(
-        sorted_hidden,
-        gate_up_proj.transpose(-2, -1),
-        offs=offsets,
-    )
-    gate, up = gate_up.chunk(2, dim=-1)
-    intermediate = act_fn(gate) * up
-    current = torch._grouped_mm(
-        intermediate,
-        down_proj.transpose(-2, -1),
-        offs=offsets,
-    )
-    sorted_weights = weights[permutation]
-    current = current * sorted_weights.unsqueeze(-1)
-    return current[inverse]
 
 
 def expert_parallel_forward(
@@ -476,41 +494,7 @@ def expert_parallel_forward(
         token_ids,
         num_tokens,
         hidden_dim,
-    )
-
-
-def _ep_experts_forward(
-    module: nn.Module,
-    hidden_states: torch.Tensor,
-    top_k_index: torch.Tensor,
-    top_k_weights: torch.Tensor,
-    layout: MoeParallelLayout,
-) -> torch.Tensor:
-    expert_offset = (
-        0 if layout.a2a_backend == MoeA2ABackend.DEEPEP else layout.global_expert_offset
-    )
-
-    def local_forward(
-        recv_hidden: torch.Tensor,
-        recv_expert_ids: torch.Tensor,
-        recv_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        return _local_grouped_experts_forward(
-            recv_hidden,
-            module.gate_up_proj,
-            module.down_proj,
-            recv_expert_ids,
-            recv_weights,
-            module.act_fn,
-            expert_offset,
-        )
-
-    return expert_parallel_forward(
-        hidden_states,
-        top_k_index,
-        top_k_weights,
-        layout,
-        local_forward,
+        expert_ids,
     )
 
 
@@ -528,32 +512,6 @@ def slice_expert_parameters(model: nn.Module, layout: MoeParallelLayout) -> int:
         module._global_expert_offset = start
         sliced += 1
     return sliced
-
-
-def install_expert_parallel(model: nn.Module, layout: MoeParallelLayout) -> int:
-    if not layout.enabled:
-        return 0
-    installed = 0
-    for module in model.modules():
-        if module.__class__.__name__ not in EXPERT_MODULE_NAMES:
-            continue
-        if getattr(module, "_ep_forward_installed", False):
-            continue
-
-        def forward(
-            hidden_states: torch.Tensor,
-            top_k_index: torch.Tensor,
-            top_k_weights: torch.Tensor,
-            *,
-            _module: nn.Module = module,
-            _layout: MoeParallelLayout = layout,
-        ) -> torch.Tensor:
-            return _ep_experts_forward(_module, hidden_states, top_k_index, top_k_weights, _layout)
-
-        module.forward = forward  # type: ignore[method-assign]
-        module._ep_forward_installed = True
-        installed += 1
-    return installed
 
 
 def resolve_num_experts(model: nn.Module, spec_num_experts: int | None) -> int:

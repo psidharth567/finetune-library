@@ -68,6 +68,8 @@ class _FusedLoraLinearCrossEntropy(torch.autograd.Function):
                 beta=1.0,
                 alpha=scaling,
             ).contiguous()
+            # Logits stay bf16 here (no .float() upcast like HF's ForCausalLMLoss):
+            # measured ~1.8% slower on Qwen3-8B DDP with no training-quality benefit.
             labels = target[start:end].contiguous()
             loss_slice = losses[start:end]
 

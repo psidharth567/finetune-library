@@ -38,9 +38,8 @@ def scaffold_project_config(
     config_dir = finetune_root / "configs"
     output_dir = finetune_root / "outputs" / run_name
     cache_dir = finetune_root / ".cache" / "prepared"
-    hf_cache = project_root / ".cache" / "huggingface"
 
-    for directory in (config_dir, output_dir, cache_dir, hf_cache):
+    for directory in (config_dir, output_dir, cache_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     resolved_format = str(data_format or _default_data_format(task))
@@ -59,7 +58,6 @@ def scaffold_project_config(
         "task": task.value,
         "model": {
             "name": model_name,
-            "cache_dir": str(hf_cache),
         },
         "data": {
             "format": resolved_format,

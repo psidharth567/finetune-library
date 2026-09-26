@@ -29,13 +29,27 @@ def test_all_model_profiles_are_strict_and_registered() -> None:
 def test_registry_contains_exact_production_set() -> None:
     assert {spec.repo_id for spec in unique_models()} == {
         "Qwen/Qwen3-8B",
+        "Qwen/Qwen3-8B-Base",
         "Qwen/Qwen3-14B",
         "Qwen/Qwen3-32B",
         "Qwen/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3.5-35B-A3B-Base",
+        "Qwen/Qwen3.5-9B-Base",
         "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
         "allenai/Olmo-3-32B-Think-DPO",
+        "allenai/Olmo-3-1125-32B",
+        "allenai/Olmo-3-1025-7B",
         "google/gemma-4-26B-A4B-it",
+        "google/gemma-4-26B-A4B",
         "google/gemma-4-31B-it",
+        "google/gemma-4-31B",
+        "google/gemma-3-27b-pt",
+        "google/gemma-2-27b",
+        "google/gemma-2-9b",
+        "Qwen/Qwen3-30B-A3B",
+        "Qwen/Qwen3-30B-A3B-Base",
+        "allenai/OLMo-2-1124-7B",
+        "allenai/OLMo-2-1124-13B",
     }
 
 
