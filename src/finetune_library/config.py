@@ -90,6 +90,10 @@ class DataConfig(StrictModel):
     require_full_seq_length: bool = False
     length_policy: Literal["global", "per_example", "per_dataset"] = "global"
     default_max_length: PositiveInt | None = None
+    # SFT only: an example longer than training.max_seq_length is never
+    # truncated (that would cut the prompt or the target). "drop" skips it and
+    # reports the count at prepare time; "error" fails preparation instead.
+    sft_overlength: Literal["drop", "error"] = "drop"
 
     @model_validator(mode="after")
     def validate_source(self) -> DataConfig:
@@ -265,6 +269,41 @@ class ExperimentConfig(StrictModel):
     checkpoint: CheckpointConfig = CheckpointConfig()
     logging: LoggingConfig = LoggingConfig()
 
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_sft_packing_isolation(cls, values: object) -> object:
+        """SFT packing always isolates examples; make that explicit in the config.
+
+        Packed SFT examples must not attend to each other, so for task=sft with
+        data.packing=true an omitted data.packing_isolation resolves to
+        "attention" and an explicit "none" is rejected.
+        """
+        if not isinstance(values, dict) or values.get("task") not in (Task.SFT, Task.SFT.value):
+            return values
+        data = values.get("data")
+        if not isinstance(data, dict) or not data.get("packing", True):
+            return values
+        isolation = data.get("packing_isolation")
+        if isolation is None:
+            return {**values, "data": {**data, "packing_isolation": "attention"}}
+        if isolation != "attention":
+            raise ValueError(
+                "task=sft with data.packing=true packs whole examples and always isolates "
+                "them (data.packing_isolation=attention); packing_isolation=none would let "
+                "packed examples attend to each other"
+            )
+        return values
+
+    def packing_isolation(self) -> str:
+        """Effective isolation mode (SFT packing is always isolated).
+
+        Use this rather than data.packing_isolation: model_copy() bypasses the
+        validator above.
+        """
+        if self.task == Task.SFT and self.data.packing:
+            return "attention"
+        return self.data.packing_isolation
+
     @model_validator(mode="after")
     def validate_task_data(self) -> ExperimentConfig:
         cpt_formats = {DataFormat.TEXT, DataFormat.TOKENIZED}
@@ -281,13 +320,19 @@ class ExperimentConfig(StrictModel):
             )
         if self.data.default_max_length is not None and self.data.length_policy == "global":
             raise ValueError("data.default_max_length requires length_policy != global")
-        if self.data.packing_isolation == "attention" and self.runtime.attention not in (
-            "flash_attention_2",
-            "flash_attention_3",
-        ):
+        if self.data.packing_isolation == "attention" and self.runtime.attention == "flex_attention":
+            # Isolation is driven by position_ids restarting at 0 in a padding-free
+            # batch: flash attention turns that into varlen cu_seqlens, sdpa/eager
+            # into a block-diagonal causal mask (transformers masking_utils). flex
+            # is untested with packed position_ids.
             raise ValueError(
-                "data.packing_isolation=attention uses padding-free varlen attention driven by "
-                "position_ids; set runtime.attention to flash_attention_2 or flash_attention_3"
+                "data.packing_isolation=attention is not supported with "
+                "runtime.attention=flex_attention; use sdpa, eager, or flash_attention_2/3"
+            )
+        if self.task == Task.SFT and self.data.chunk_long_examples:
+            raise ValueError(
+                "data.chunk_long_examples splits examples and is CPT-only; SFT examples are "
+                "never split or truncated (see data.sft_overlength)"
             )
         return self
 

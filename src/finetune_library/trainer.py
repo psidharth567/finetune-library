@@ -36,6 +36,7 @@ from finetune_library.logging_utils import EventLogger, setup_training_logger
 from finetune_library.lora import consolidate_tied_lora_gradients, inject_lora
 from finetune_library.moe_parallel import build_moe_layout, resolve_num_experts, slice_expert_parameters
 from finetune_library.loss import build_training_model
+from finetune_library.packed_linear_attention import patch_linear_attention_for_packing
 from finetune_library.optim import build_optimizer, build_scheduler
 from finetune_library.registry import resolve_model
 from finetune_library.runtime import load_runtime, maybe_compile
@@ -160,7 +161,7 @@ def _make_loader(
         batch_size=config.training.per_device_batch_size,
         sampler=sampler,
         shuffle=shuffle,
-        collate_fn=CausalCollator(tokenizer, config.training.max_seq_length, packing_isolation=config.data.packing_isolation),
+        collate_fn=CausalCollator(tokenizer, config.training.max_seq_length, packing_isolation=config.packing_isolation()),
         num_workers=workers,
         pin_memory=context.device.type == "cuda",
         persistent_workers=workers > 0,
@@ -237,6 +238,12 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
             torch.backends.cuda.matmul.allow_tf32 = True
 
         runtime = load_runtime(config, spec, context)
+        if config.packing_isolation() == "attention":
+            # Isolated packing: softmax attention is isolated by position_ids;
+            # linear-attention (GDN) layers need the boundaries passed explicitly.
+            patched = patch_linear_attention_for_packing(runtime.model)
+            if patched and context.is_main:
+                logger.info("packed-sequence isolation: patched %s linear-attention layers", patched)
         moe_layout = None
         if spec.moe and context.expert_parallel_size > 1:
             num_experts = resolve_num_experts(runtime.model, spec.num_experts)

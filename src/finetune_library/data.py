@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -13,6 +14,9 @@ from finetune_library.config import DataConfig, DataFormat, ExperimentConfig, Ta
 
 IGNORE_INDEX = -100
 PREPARATION_VERSION = 4
+# Bumped whenever SFT preparation output changes; part of SFT cache keys only,
+# so CPT cache keys (and prepared CPT data) are unaffected.
+SFT_PREPARATION_VERSION = 1
 
 
 class TokenDataset(Dataset[dict[str, list[int]]]):
@@ -457,14 +461,136 @@ def iter_packed_rows(
         yield {"input_ids": ids_buffer, "labels": labels_buffer}
 
 
+def pack_whole_examples(
+    rows: Sequence[Mapping[str, Sequence[int]]],
+    *,
+    max_length: int,
+) -> list[dict[str, list[int]]]:
+    """Pack complete examples into windows of at most ``max_length`` tokens.
+
+    Best-fit decreasing: examples are placed longest first, each into the open
+    window with the least room that still fits it whole, else a new window. An
+    example is never split across windows, so every window holds only complete
+    examples (and is usually shorter than ``max_length``; the padding-free
+    collator does not pad it). ``position_ids`` restart at 0 for every example,
+    which is what isolates examples from each other at attention time.
+
+    Deterministic for a given input order. Every row must already fit
+    (``len(input_ids) <= max_length``).
+    """
+    order = sorted(range(len(rows)), key=lambda index: (-len(rows[index]["input_ids"]), index))
+    bins: list[list[int]] = []
+    open_caps: list[int] = []  # sorted distinct remaining capacities with an open window
+    windows_by_cap: dict[int, list[int]] = {}
+    for index in order:
+        length = len(rows[index]["input_ids"])
+        if length == 0:
+            continue
+        if length > max_length:
+            raise ValueError(f"example of {length} tokens does not fit max_length={max_length}")
+        position = bisect.bisect_left(open_caps, length)
+        if position < len(open_caps):
+            cap = open_caps[position]
+            windows = windows_by_cap[cap]
+            window = windows.pop()
+            if not windows:
+                del windows_by_cap[cap]
+                open_caps.pop(position)
+        else:
+            cap = max_length
+            window = len(bins)
+            bins.append([])
+        bins[window].append(index)
+        remaining = cap - length
+        if remaining > 0:
+            if remaining not in windows_by_cap:
+                windows_by_cap[remaining] = []
+                bisect.insort(open_caps, remaining)
+            windows_by_cap[remaining].append(window)
+
+    packed: list[dict[str, list[int]]] = []
+    for members in bins:
+        ids: list[int] = []
+        labels: list[int] = []
+        positions: list[int] = []
+        for index in members:
+            row = rows[index]
+            ids.extend(int(token) for token in row["input_ids"])
+            labels.extend(int(token) for token in row["labels"])
+            positions.extend(range(len(row["input_ids"])))
+        packed.append({"input_ids": ids, "labels": labels, "position_ids": positions})
+    return packed
+
+
+def _iter_sft_rows(
+    tokenized: Iterable[dict[str, list[int]]],
+    *,
+    max_length: int,
+    packing: bool,
+    overlength: str,
+    stats: dict[str, Any] | None,
+) -> Iterator[dict[str, list[int]]]:
+    """SFT examples are kept whole: never truncated, chunked, or split.
+
+    Over-length examples are dropped (or rejected) per data.sft_overlength.
+    With packing, whole examples are bin-packed (see pack_whole_examples);
+    data.drop_remainder / require_full_seq_length do not apply, since no
+    window is a stream remainder and dropping one would drop examples.
+    """
+    kept: list[dict[str, list[int]]] = []
+    raw = 0
+    dropped = 0
+    longest_dropped = 0
+    for row in tokenized:
+        raw += 1
+        length = len(row["input_ids"])
+        if length == 0:
+            continue
+        if length > max_length:
+            if overlength == "error":
+                raise ValueError(
+                    f"SFT example #{raw - 1} has {length} tokens > training.max_seq_length="
+                    f"{max_length}; SFT examples are never truncated. Raise max_seq_length, "
+                    "filter the data, or set data.sft_overlength=drop"
+                )
+            dropped += 1
+            longest_dropped = max(longest_dropped, length)
+            continue
+        if not packing:
+            yield row
+        else:
+            kept.append(row)
+    if packing:
+        yield from pack_whole_examples(kept, max_length=max_length)
+    if stats is not None:
+        stats.update(
+            {
+                "raw_records": raw,
+                "dropped_overlength": dropped,
+                "longest_dropped_tokens": longest_dropped,
+                "examples": raw - dropped,
+            }
+        )
+
+
 def iter_prepared_rows(
     config: ExperimentConfig,
     tokenizer: Any,
+    stats: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, list[int]]]:
     tokenized = (
         tokenize_record(row, tokenizer=tokenizer, task=config.task, data=config.data)
         for row in load_records(config.data)
     )
+    if config.task == Task.SFT:
+        yield from _iter_sft_rows(
+            tokenized,
+            max_length=config.training.max_seq_length,
+            packing=config.data.packing,
+            overlength=config.data.sft_overlength,
+            stats=stats,
+        )
+        return
     # Handle per_example length_policy: we need to allow per-row max_length override
     # For simplicity, if per_example, we chunk per row using its own effective length,
     # but packing still uses global max_length for buffer size.
@@ -492,10 +618,14 @@ def cache_key(config: ExperimentConfig, tokenizer: Any) -> str:
     from finetune_library.registry import resolve_model
 
     spec = resolve_model(config.model.name)
+    data_identity = config.data.model_dump(mode="json")
+    if config.task == Task.CPT:
+        # SFT-only field; excluded so CPT cache keys are unchanged by its addition.
+        data_identity.pop("sft_overlength")
     identity = {
         "preparation_version": PREPARATION_VERSION,
         "task": config.task.value,
-        "data": config.data.model_dump(mode="json"),
+        "data": data_identity,
         "max_seq_length": config.training.max_seq_length,
         "tokenizer": getattr(tokenizer, "name_or_path", tokenizer.__class__.__name__),
         "tokenizer_revision": config.model.revision or spec.revision,
@@ -503,6 +633,9 @@ def cache_key(config: ExperimentConfig, tokenizer: Any) -> str:
         "tokenizer_commit": getattr(tokenizer, "init_kwargs", {}).get("_commit_hash"),
         "tokenizer_vocab_size": len(tokenizer),
     }
+    if config.task == Task.SFT:
+        identity["sft_preparation_version"] = SFT_PREPARATION_VERSION
+        identity["packing_isolation"] = config.packing_isolation()
     payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()[:20]
 
@@ -537,14 +670,19 @@ def prepare_to_disk(
     # We need to iterate via load_records and tokenize to collect stats
     # We'll create a generator that also tracks stats
     rows_for_dataset: list[dict[str, list[int]]] = []
+    sft_stats: dict[str, Any] = {}
     # We cannot easily count without iterating twice; we will iterate once and store
-    for row in iter_prepared_rows(config, tokenizer):
+    for row in iter_prepared_rows(config, tokenizer, stats=sft_stats):
         rows_for_dataset.append(row)
         packed_windows += 1
         total_tokens += len(row["input_ids"])
 
     if not rows_for_dataset:
         raise ValueError("prepared dataset is empty")
+    if config.task == Task.SFT:
+        return _save_sft_prepared(
+            config, tokenizer, destination, rows_for_dataset, sft_stats, total_tokens
+        )
 
     # Estimate stats via additional pass for truncated/dropped
     # For simplicity, compute truncated as raw records longer than max_len when chunk disabled
@@ -595,6 +733,50 @@ def prepare_to_disk(
     summary_path = destination / "prep_stats.json"
     summary_path.write_text(json.dumps(metadata["stats"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"prepare-data stats: {json.dumps(metadata['stats'], sort_keys=True)}")
+    return destination
+
+
+def _save_sft_prepared(
+    config: ExperimentConfig,
+    tokenizer: Any,
+    destination: Path,
+    rows: list[dict[str, list[int]]],
+    sft_stats: dict[str, Any],
+    total_tokens: int,
+) -> Path:
+    from datasets import Dataset as HFDataset
+
+    max_len = config.training.max_seq_length
+    stats = {
+        **sft_stats,
+        "packed": config.data.packing,
+        "windows": len(rows),
+        "examples_per_window": round(sft_stats["examples"] / len(rows), 2),
+        "total_tokens": total_tokens,
+        "avg_fill_pct": round(total_tokens / (len(rows) * max_len) * 100, 2),
+    }
+    if stats["dropped_overlength"]:
+        print(
+            f"WARNING: dropped {stats['dropped_overlength']} of {stats['raw_records']} SFT "
+            f"examples longer than max_seq_length={max_len} (longest "
+            f"{stats['longest_dropped_tokens']} tokens); SFT examples are never truncated"
+        )
+    dataset = HFDataset.from_list(rows)
+    dataset.save_to_disk(str(destination))
+    metadata = {
+        "cache_key": cache_key(config, tokenizer),
+        "rows": len(dataset),
+        "max_seq_length": max_len,
+        "stats": stats,
+    }
+    (destination / "finetune_library_metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (destination / "prep_stats.json").write_text(
+        json.dumps(stats, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(f"prepare-data stats: {json.dumps(stats, sort_keys=True)}")
     return destination
 
 

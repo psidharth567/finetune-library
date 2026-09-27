@@ -198,14 +198,48 @@ over 4 layers). The production config uses `native`. Verify with:
 torchrun --nproc-per-node 8 tests/multigpu/ep_gradcheck.py 4 native
 ```
 
+## SFT packing
+
+With `task: sft` and `data.packing: true` (see
+`configs/examples/qwen3-8b-sft-packed.yaml`):
+
+- **Whole examples only.** Examples are bin-packed (best-fit decreasing)
+  into windows of at most `training.max_seq_length` tokens. An example is
+  never split across windows; if it does not fit in any open window it starts
+  a new one. `drop_remainder` does not apply.
+- **Isolated.** `packing_isolation` resolves to `attention` (an explicit
+  `none` is rejected). Batches are padding-free with `position_ids`
+  restarting at 0 per example: flash attention runs varlen, sdpa/eager get a
+  block-diagonal causal mask, and Qwen3.5's gated-delta-net layers receive
+  the example boundaries (`seq_idx` / `cu_seqlens`). The label at each
+  example start is ignored, so no example predicts the next one.
+- **Never truncated.** SFT examples longer than `max_seq_length` are dropped
+  (`data.sft_overlength: drop`, the default; counted and reported by
+  `prepare-data`) or fail preparation (`sft_overlength: error`). This applies
+  to unpacked SFT too. `chunk_long_examples` is CPT-only.
+
+CPT packing is unchanged (stream packing, truncation/chunking as configured).
+
+Verified on real weights (8xH100, bf16 unless noted), packing 37 chat
+examples into 4k-token windows: randomizing every *other* example in a
+window changes an example's per-token loss by exactly 0 — Qwen3-8B (sdpa,
+FA2), Gemma4-26B (sdpa, eager), Qwen3.5-35B-A3B (FA3 + GDN) — versus up to
+36 nats/token without isolation. In fp32, packed vs each example alone agrees
+to 2e-4 (Qwen3-8B sdpa/eager). GPU tests: `tests/test_packed_isolation_gpu.py`;
+real-model check: `tests/multigpu/packed_sft_parity.py`.
+
+Under sdpa/eager the packed mask is a dense L x L boolean over the flattened
+batch (L = per_device_batch_size x max_seq_length), so prefer flash attention
+for long SFT sequences.
+
 ## Opt-in knobs (off by default)
 
 - `distributed.reshard_after_forward`, `distributed.fsdp_prefetch_layers`,
   `distributed.ddp_static_graph` — measured no win (or slower) on our
   workloads; left off by default.
-- `data.packing_isolation: attention` — requires `flash_attention_2` or
-  `flash_attention_3` (padding-free varlen attention). ~4% slower on packed
-  data, but avoids cross-document attention.
+- `data.packing_isolation: attention` (CPT) — padding-free isolated packing
+  (any attention except `flex_attention`). ~4% slower on packed data, but
+  avoids cross-document attention. Always on for packed SFT.
 
 ## Kernel stack (container)
 

@@ -199,9 +199,21 @@ sbatch "${FINETUNE_LIBRARY_ROOT}/scripts/slurm/train-one-node.sh"
 - `distributed.reshard_after_forward`, `distributed.fsdp_prefetch_layers`,
   `distributed.ddp_static_graph` — measured no win (or slower) on our
   workloads.
-- `data.packing_isolation: attention` — requires `flash_attention_2`/`_3`
-  (padding-free varlen attention); ~4% slower on packed data but avoids
+- `data.packing_isolation: attention` (CPT) — padding-free isolated packing,
+  any attention except `flex_attention`; ~4% slower on packed data but avoids
   cross-document attention.
+
+## SFT packing
+
+`task: sft` + `data.packing: true` bin-packs **whole** examples into windows
+of <= `max_seq_length` (never split), always isolated (`packing_isolation`
+resolves to `attention`; Qwen3.5 GDN layers get example boundaries via
+`packed_linear_attention.py`). SFT examples longer than `max_seq_length` are
+never truncated: dropped and reported (`data.sft_overlength: drop`, default)
+or rejected (`error`) — packed or not. Example:
+`configs/examples/qwen3-8b-sft-packed.yaml`. Check `prep_stats.json`
+(`dropped_overlength`, `examples_per_window`, `avg_fill_pct`) after
+`prepare-data`.
 
 ## Do not
 

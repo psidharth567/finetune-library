@@ -62,29 +62,13 @@ RUN uv venv --python 3.12 /opt/venv
 ENV PATH=/opt/venv/bin:$PATH \
     VIRTUAL_ENV=/opt/venv
 
-COPY pyproject.toml uv.lock ./finetune-library/
-COPY src ./finetune-library/src
-COPY README.md AGENTS.md ./finetune-library/
-COPY configs ./finetune-library/configs
-COPY scripts ./finetune-library/scripts
-COPY tests ./finetune-library/tests
-# Only the small smoke fixtures (data/dummy_*.jsonl) pass .dockerignore; the
-# production configs point at data/dummy_cpt.jsonl, so bake them in.
-COPY data ./finetune-library/data
 COPY wheels/ /wheels/
 
-# Host source permissions can be arbitrarily restrictive (e.g. 700 dirs, 750
-# scripts) and are not preserved meaningfully by COPY anyway (owner becomes
-# root). scripts/run.sh runs the container as the invoking host uid:gid by
-# default, so normalize to world-readable/executable here rather than relying
-# on host perms or forcing every caller to run as root.
-RUN chmod -R a+rX /opt/toolkit/finetune-library && \
-    find /opt/toolkit/finetune-library/scripts -name '*.sh' -exec chmod a+rx {} + && \
-    # /root defaults to 700: `uv python install` puts the actual cpython
-    # binary under /root/.local/share/uv/python/..., which /opt/venv/bin/python
-    # symlinks to. A non-root --user can't traverse into /root at all
-    # otherwise ("bad interpreter: Permission denied" running any venv binary).
-    chmod 755 /root
+# /root defaults to 700: `uv python install` puts the actual cpython
+# binary under /root/.local/share/uv/python/..., which /opt/venv/bin/python
+# symlinks to. A non-root --user can't traverse into /root at all
+# otherwise ("bad interpreter: Permission denied" running any venv binary).
+RUN chmod 755 /root
 
 ENV FINETUNE_LIBRARY_ROOT=/opt/toolkit/finetune-library
 
@@ -162,8 +146,29 @@ ARG INSTALL_UNSLOTH=0
 RUN if [ "${INSTALL_UNSLOTH}" = "1" ]; then \
       uv pip install "unsloth==2026.7.6" --extra-index-url https://download.pytorch.org/whl/cu129; \
     fi && \
-    uv pip install "pytest==8.4.2" && \
-    uv pip install -e ./finetune-library --no-deps || uv pip install -e ./finetune-library
+    uv pip install "pytest==8.4.2"
+
+# Library source goes in last: everything above is dependencies only, so a
+# code change rebuilds (and re-pushes / re-pulls) just these small layers
+# instead of the whole multi-GB stack.
+COPY pyproject.toml uv.lock ./finetune-library/
+COPY src ./finetune-library/src
+COPY README.md AGENTS.md ./finetune-library/
+COPY configs ./finetune-library/configs
+COPY scripts ./finetune-library/scripts
+COPY tests ./finetune-library/tests
+# Only the small smoke fixtures (data/dummy_*.jsonl) pass .dockerignore; the
+# production configs point at data/dummy_cpt.jsonl, so bake them in.
+COPY data ./finetune-library/data
+
+# Host source permissions can be arbitrarily restrictive (e.g. 700 dirs, 750
+# scripts) and are not preserved meaningfully by COPY anyway (owner becomes
+# root). scripts/run.sh runs the container as the invoking host uid:gid by
+# default, so normalize to world-readable/executable here rather than relying
+# on host perms or forcing every caller to run as root.
+RUN chmod -R a+rX /opt/toolkit/finetune-library && \
+    find /opt/toolkit/finetune-library/scripts -name '*.sh' -exec chmod a+rx {} + && \
+    (uv pip install -e ./finetune-library --no-deps || uv pip install -e ./finetune-library)
 
 # Full CPU-safe unit test suite (GPU-only tests self-skip via
 # `pytest.mark.skipif(not torch.cuda.is_available(), ...)`).
