@@ -26,9 +26,9 @@ export FLA_SKIP_TRITON_AUTOTUNE=1
 "${FINETUNE_LIBRARY_ROOT}/scripts/run.sh" configs/models/qwen35-35b-a3b-cpt.yaml train
 ```
 
-Image: `ghcr.io/psidharth567/finetune-library:latest` (the `scripts/run.sh`
-default; `scripts/build.sh TAG` builds it locally, also tagged
-`toolkit/finetune:TAG`). `NODE=<host>` on `build.sh`/`run.sh` builds/runs
+Image: `ghcr.io/psidharth567/finetune-library:latest` — the only finetune
+image (the `scripts/run.sh` default; `scripts/build.sh TAG` builds
+`ghcr.io/psidharth567/finetune-library:TAG`). `NODE=<host>` on `build.sh`/`run.sh` builds/runs
 over ssh; unset runs on the current host.
 
 Before building, run `scripts/fetch_wheels.sh` to download the cp312/cu129/

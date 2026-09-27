@@ -9,8 +9,7 @@
 #
 # Env:
 #   NODE            Optional. Build on this host via ssh instead of locally.
-#   TAG             Image tag (default: latest). Tagged locally as both
-#                   ${IMAGE_NAME}:<TAG> and toolkit/finetune:<TAG>.
+#   TAG             Image tag (default: latest) -> ${IMAGE_NAME}:<TAG>
 #   IMAGE_NAME      Registry image name (default: ghcr.io/psidharth567/finetune-library)
 #   PUSH_GHCR       1 to also push ${IMAGE_NAME}:<TAG> (default: 0; needs docker login ghcr.io)
 #   ALLOW_MISSING_WHEELS  Passed through as a Docker build ARG (default: 0)
@@ -20,7 +19,6 @@ FINETUNE_LIBRARY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TAG="${1:-${TAG:-latest}}"
 IMAGE_NAME="${IMAGE_NAME:-ghcr.io/psidharth567/finetune-library}"
-LOCAL_TAG="toolkit/finetune:${TAG}"
 REMOTE_TAG="${IMAGE_NAME}:${TAG}"
 GIT_REV="$(git -C "${FINETUNE_LIBRARY_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 NODE="${NODE:-}"
@@ -35,12 +33,11 @@ time docker build \
   --build-arg ALLOW_MISSING_WHEELS=${ALLOW_MISSING_WHEELS} \
   --label org.opencontainers.image.version=${TAG} \
   --label org.opencontainers.image.revision=${GIT_REV} \
-  -t "${LOCAL_TAG}" \
   -t "${REMOTE_TAG}" \
   -f docker/Dockerfile \
   .
 echo "[build] image size:"
-docker images "${LOCAL_TAG}" --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.ID}}'
+docker images "${REMOTE_TAG}" --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.ID}}'
 CMD
 )
 
@@ -70,4 +67,4 @@ REMOTE
   fi
 fi
 
-echo "[build] done: ${REMOTE_TAG} (also ${LOCAL_TAG})"
+echo "[build] done: ${REMOTE_TAG}"

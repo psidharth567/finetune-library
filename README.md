@@ -80,7 +80,7 @@ production config in this repo uses `backend: native` and does not require it.
 Build (runs the full CPU pytest suite as part of the build):
 
 ```bash
-scripts/build.sh latest                  # -> ghcr.io/psidharth567/finetune-library:latest (+ toolkit/finetune:latest)
+scripts/build.sh latest                  # -> ghcr.io/psidharth567/finetune-library:latest
 NODE=<host> scripts/build.sh mytag       # build on a remote host via ssh
 ```
 
