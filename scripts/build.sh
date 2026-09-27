@@ -22,6 +22,7 @@ TAG="${1:-${TAG:-latest}}"
 IMAGE_NAME="${IMAGE_NAME:-ghcr.io/psidharth567/finetune-library}"
 LOCAL_TAG="toolkit/finetune:${TAG}"
 REMOTE_TAG="${IMAGE_NAME}:${TAG}"
+GIT_REV="$(git -C "${FINETUNE_LIBRARY_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 NODE="${NODE:-}"
 PUSH_GHCR="${PUSH_GHCR:-0}"
 ALLOW_MISSING_WHEELS="${ALLOW_MISSING_WHEELS:-0}"
@@ -32,6 +33,8 @@ cd "${FINETUNE_LIBRARY_ROOT}"
 echo "[build] context: \$(du -sh . 2>/dev/null | cut -f1) (before .dockerignore filtering)"
 time docker build \
   --build-arg ALLOW_MISSING_WHEELS=${ALLOW_MISSING_WHEELS} \
+  --label org.opencontainers.image.version=${TAG} \
+  --label org.opencontainers.image.revision=${GIT_REV} \
   -t "${LOCAL_TAG}" \
   -t "${REMOTE_TAG}" \
   -f docker/Dockerfile \
