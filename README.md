@@ -1,11 +1,35 @@
 # finetune-lib
 
-LoRA toolkit for continual pretraining (CPT) and supervised finetuning (SFT).
+LoRA toolkit for continual pretraining (CPT) and supervised finetuning (SFT)
+on a single 8×GPU node: DDP, FSDP/HSDP, and MoE expert parallelism, with
+pinned model revisions and a prebuilt kernel stack (FA2/FA3, Liger, FLA,
+DeepEP).
 
-Agents should read [`AGENTS.md`](AGENTS.md) for the full workflow.
+Agents should read [`AGENTS.md`](AGENTS.md) for the full workflow. All paths
+below are relative to the repo root.
 
-This repo is standalone: everything below is relative to the repo root (the
-directory this README lives in).
+## Requirements
+
+- Linux x86_64, NVIDIA **Hopper** GPUs (H100/H200; the kernels are built for
+  `sm_90a`), 8 GPUs per node for the production configs
+- NVIDIA driver + NVIDIA Container Toolkit (the image carries `cuda-compat`
+  for CUDA 12.8, so older 535+ datacenter drivers work)
+- Docker, or Python 3.12 + [uv](https://docs.astral.sh/uv/) for a local venv
+
+## Quick start (prebuilt image)
+
+```bash
+git clone https://github.com/psidharth567/finetune-library.git
+cd finetune-library
+docker pull ghcr.io/psidharth567/finetune-library:latest
+
+# Download model weights into the cache the container mounts (it runs offline by default):
+HF_HUB_OFFLINE=0 scripts/run.sh configs/models/qwen3-8b-cpt.yaml train
+# Afterwards, runs stay offline and fail loudly on a missing pinned revision:
+scripts/run.sh configs/models/qwen3-8b-cpt.yaml train
+```
+
+For gated models, export `HF_TOKEN` before the first (downloading) run.
 
 ## Quick start (local venv)
 
@@ -25,32 +49,42 @@ finetune-lib prepare-data --config configs/models/qwen3-8b-cpt.yaml
 scripts/production/launch-one-node.sh configs/models/qwen3-8b-cpt.yaml train
 ```
 
-## Docker (standalone image, recommended on GPU nodes)
+## Docker image
 
-Build context is this repo's root only — no dependency on any sibling
-project. Configs, launch scripts, and tests are baked into the image at
-`/opt/toolkit/finetune-library`.
+Published at `ghcr.io/psidharth567/finetune-library` (tags: `latest`, and the
+package version, e.g. `1.0.0`). Configs, launch scripts, and tests are baked
+into the image at `/opt/toolkit/finetune-library`.
 
-**Wheels required.** Populate `wheels/` (gitignored, not part of the repo)
-with the cp312 / cu129 / torch 2.11 wheels before building:
-`flash_attn`, `flash_attn_3`, `deep_ep`, `causal_conv1d`, `mamba_ssm`. See the
-header of `docker/Dockerfile` and `docker/build_deepep_wheel.sh` (for building
-`deep_ep` from source). A missing wheel fails the build loudly by default;
-pass `ALLOW_MISSING_WHEELS=1` to intentionally build a reduced image (e.g.
-SDPA-only attention, no DeepEP).
+### Building it yourself
+
+Build context is the repo root. The image installs five prebuilt kernel
+wheels from `wheels/` (gitignored): `flash_attn`, `flash_attn_3`, `deep_ep`,
+`causal_conv1d`, `mamba_ssm` (cp312 / torch 2.11 / CUDA 12). Download the
+exact set from the
+[`wheels-torch2.11-cu129`](https://github.com/psidharth567/finetune-library/releases/tag/wheels-torch2.11-cu129)
+release (sha256-verified):
+
+```bash
+scripts/fetch_wheels.sh
+```
+
+`docker/build_deepep_wheel.sh` rebuilds `deep_ep` from source. A missing
+wheel fails the build loudly by default; pass `ALLOW_MISSING_WHEELS=1` to
+intentionally build a reduced image (e.g. SDPA-only attention, no DeepEP).
 
 `unsloth` is **not** installed by default — `unsloth==2026.7.6` crashes at
 import under torch 2.11 ("Artifact of type=inductor already registered").
 Opt in with `--build-arg INSTALL_UNSLOTH=1` if you specifically need it; every
 production config in this repo uses `backend: native` and does not require it.
 
-Build (~4 min; runs the full CPU pytest suite as part of the build):
+Build (runs the full CPU pytest suite as part of the build):
 
 ```bash
-scripts/build.sh latest                          # -> toolkit/finetune:latest
-NODE=<host> scripts/build.sh standalone-test      # build on a remote host via ssh
-PUSH_GHCR=1 scripts/build.sh 12.8-cu129           # also push to GHCR
+scripts/build.sh latest                  # -> ghcr.io/psidharth567/finetune-library:latest (+ toolkit/finetune:latest)
+NODE=<host> scripts/build.sh mytag       # build on a remote host via ssh
 ```
+
+### Running
 
 Run:
 
@@ -67,7 +101,7 @@ scripts/run.sh _ merge --checkpoint outputs/qwen3-8b-cpt/final --output outputs/
 | Var | Default | Purpose |
 |---|---|---|
 | `NODE` | unset (run locally) | ssh to this host and run there |
-| `IMAGE` | `toolkit/finetune:latest` | image to run |
+| `IMAGE` | `ghcr.io/psidharth567/finetune-library:latest` | image to run (pulled if missing) |
 | `HF_HOME` | `<repo>/.cache/huggingface` | HF cache mounted at `/cache` inside the container |
 | `DATA_DIR` | unset | extra host dir bind-mounted at `/data` |
 | `EXTRA_MOUNTS` | unset | extra `-v host:container[:ro]` args, space separated |
@@ -76,8 +110,10 @@ scripts/run.sh _ merge --checkpoint outputs/qwen3-8b-cpt/final --output outputs/
 | `HF_HUB_OFFLINE` | `1` (inside container) | `1` fails loudly instead of silently downloading a missing revision; `0` allows downloads |
 | `LOG` | `<repo>/logs/run-<timestamp>.log` | log file path |
 | `RUN_AS_ROOT` | `0` | `1` skips `--user`, runs as root inside the container |
+| `HF_TOKEN` | unset | forwarded if set (gated models); local runs only, not over `NODE=` |
 
-`scripts/run.sh` mounts `/projects` and the repo's `HF_HOME`, runs as your
+`scripts/run.sh` mounts the repo's `HF_HOME` at `/cache` (plus `/projects` at
+the same path, if the host has it — for shared-filesystem clusters), runs as your
 invoking uid:gid by default (so outputs aren't root-owned), forwards NCCL env
 vars and every `FINETUNE_*` env var that's set on the host, and uses
 `--gpus all --ipc=host --ulimit memlock=-1 --shm-size=64g` (or `GPUS=...` for
@@ -200,10 +236,18 @@ sbatch scripts/slurm/train-one-node.sh
 - For MoE + `grouped_mm`, block-level compile is auto-downgraded to `loss_only`.
 - Qwen 3.5: export `FLA_SKIP_TRITON_AUTOTUNE=1` on memory-tight EP runs.
 
-## Publish
+## Publish (maintainers)
 
 ```bash
-PUSH_GHCR=1 scripts/build.sh 12.8-cu129
+PUSH_GHCR=1 scripts/build.sh 1.0.0
+PUSH_GHCR=1 scripts/build.sh latest
 ```
 
 Requires `docker login ghcr.io` with a GitHub PAT (`write:packages`).
+`IMAGE_NAME` overrides the registry path for a fork.
+
+## License
+
+[Apache-2.0](LICENSE). The prebuilt wheels and the image bundle third-party
+software under their own licenses (PyTorch, FlashAttention, DeepEP, mamba,
+FLA, Liger, NVIDIA CUDA base image).

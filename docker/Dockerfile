@@ -1,20 +1,22 @@
 # Standalone finetune-library image.
 #
-# Build context is finetune-library/ itself (NOT the monorepo root):
-#   docker build -f finetune-library/docker/Dockerfile -t toolkit/finetune:latest finetune-library/
-# or via finetune-library/scripts/build.sh.
+# Build context is the repo root:
+#   docker build -f docker/Dockerfile -t ghcr.io/psidharth567/finetune-library:latest .
+# or via scripts/build.sh.
 #
-# All wheels this Dockerfile installs live under finetune-library/wheels/ (gitignored).
-# Populate it with (cp312 / cu129 / torch2.11 variants only):
+# All wheels this Dockerfile installs live under wheels/ (gitignored).
+# scripts/fetch_wheels.sh downloads the exact set from the GitHub release;
+# otherwise populate it with (cp312 / cu129 / torch2.11 variants only):
 #   flash_attn-*-cp312-*.whl
 #   flash_attn_3-*-abi3*.whl        (or cp312)
 #   deep_ep-*-cp312-*.whl
-#   causal_conv1d-*-cp312-*.whl     (already checked into the repo tree via git-ignored copy)
+#   causal_conv1d-*-cp312-*.whl
 #   mamba_ssm-*-cp312-*.whl
-# See finetune-library/docker/build_deepep_wheel.sh for building deep_ep from source.
+# See docker/build_deepep_wheel.sh for building deep_ep from source.
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
-LABEL org.opencontainers.image.source="https://github.com/psidharth567/toolkit" \
-    org.opencontainers.image.title="toolkit/finetune" \
+LABEL org.opencontainers.image.source="https://github.com/psidharth567/finetune-library" \
+    org.opencontainers.image.title="finetune-library" \
+    org.opencontainers.image.licenses="Apache-2.0" \
     org.opencontainers.image.description="Standalone finetune-library: LoRA CPT/SFT, torch2.11 cu129, FA2+FA3, FLA, Liger, DeepEP, sm_90a" \
     org.opencontainers.image.base.name="nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04"
 

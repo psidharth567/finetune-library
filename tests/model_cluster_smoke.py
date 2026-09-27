@@ -18,7 +18,8 @@ def main() -> None:
     parser.add_argument("config")
     parser.add_argument(
         "--cache-dir",
-        default="/projects/data/llmteam/sidharth/sycophancy/eval/.cache/huggingface",
+        default=None,
+        help="HF cache_dir override (default: standard $HF_HOME/hub cache)",
     )
     parser.add_argument("--sequence-length", type=int, default=64)
     parser.add_argument("--max-steps", type=int, default=1)

@@ -10,13 +10,6 @@ def main() -> None:
     config = ExperimentConfig.from_yaml("configs/models/gemma4-26b-a4b-it-cpt.yaml")
     config = config.model_copy(
         update={
-            "model": config.model.model_copy(
-                update={
-                    "cache_dir": (
-                        "/projects/data/llmteam/sidharth/sycophancy/eval/.cache/huggingface"
-                    )
-                }
-            ),
             "training": config.training.model_copy(
                 update={
                     "output_dir": "outputs/validation-gemma4-26b-hsdp",

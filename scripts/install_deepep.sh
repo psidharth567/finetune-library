@@ -4,13 +4,14 @@ set -euo pipefail
 
 DEEPEP_COMMIT="${DEEPEP_COMMIT:-9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee}"
 DEEPEP_DIR="${DEEPEP_DIR:-/tmp/DeepEP}"
-WHEEL_DIR="${WHEEL_DIR:-/projects/data/llmteam/sidharth/toolkit/finetune-library/wheels}"
+FINETUNE_LIBRARY_ROOT="${FINETUNE_LIBRARY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+WHEEL_DIR="${WHEEL_DIR:-${FINETUNE_LIBRARY_ROOT}/wheels}"
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0a}"
 LOG_PATH="${LOG_PATH:-${WHEEL_DIR}/deepep-build.log}"
 
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export GDRCOPY_HOME="${GDRCOPY_HOME:-/usr/src/gdrdrv-2.5.1/}"
-export HF_HOME="${HF_HOME:-/projects/data/llmteam/sidharth/toolkit/finetune-library/.cache/huggingface}"
+export HF_HOME="${HF_HOME:-${FINETUNE_LIBRARY_ROOT}/.cache/huggingface}"
 
 if python3 -c "import deep_ep" >/dev/null 2>&1; then
   echo "deep_ep already installed: $(python3 -c 'import deep_ep; print(deep_ep.__file__)')"

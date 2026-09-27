@@ -26,13 +26,14 @@ export FLA_SKIP_TRITON_AUTOTUNE=1
 "${FINETUNE_LIBRARY_ROOT}/scripts/run.sh" configs/models/qwen35-35b-a3b-cpt.yaml train
 ```
 
-Build tag: `toolkit/finetune:latest` (or any `TAG` via `scripts/build.sh`).
-`NODE=<host>` on `build.sh`/`run.sh` builds/runs over ssh; unset runs on the
-current host.
+Image: `ghcr.io/psidharth567/finetune-library:latest` (the `scripts/run.sh`
+default; `scripts/build.sh TAG` builds it locally, also tagged
+`toolkit/finetune:TAG`). `NODE=<host>` on `build.sh`/`run.sh` builds/runs
+over ssh; unset runs on the current host.
 
-Before building, populate `wheels/` (gitignored) with the cp312/cu129/
-torch-2.11 wheels: `flash_attn`, `flash_attn_3`, `deep_ep`, `causal_conv1d`,
-`mamba_ssm`. A missing wheel is a hard build failure unless
+Before building, run `scripts/fetch_wheels.sh` to download the cp312/cu129/
+torch-2.11 wheels into `wheels/` (gitignored): `flash_attn`, `flash_attn_3`,
+`deep_ep`, `causal_conv1d`, `mamba_ssm`. A missing wheel is a hard build failure unless
 `ALLOW_MISSING_WHEELS=1`. `unsloth` is not installed by default (broken under
 torch 2.11); opt in with `--build-arg INSTALL_UNSLOTH=1` if you specifically
 need it — no production config requires it.
@@ -224,7 +225,7 @@ Minimum checklist:
 
 ```bash
 cd "${FINETUNE_LIBRARY_ROOT}"
-PUSH_GHCR=1 scripts/build.sh 12.8-cu129
+PUSH_GHCR=1 scripts/build.sh 1.0.0 && PUSH_GHCR=1 scripts/build.sh latest
 ```
 
 Requires `docker login ghcr.io` with a GitHub PAT (`write:packages`).

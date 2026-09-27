@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
 # Build the standalone finetune-library Docker image.
 #
-# Build context is finetune-library/ only (not the monorepo) — see docker/Dockerfile.
+# Build context is the repo root — see docker/Dockerfile. Needs the kernel
+# wheels in wheels/ first: scripts/fetch_wheels.sh downloads them.
 #
 # Usage:
 #   scripts/build.sh [TAG]
 #
 # Env:
 #   NODE            Optional. Build on this host via ssh instead of locally.
-#   TAG             Image tag (default: latest) -> toolkit/finetune:<TAG>
-#   PUSH_GHCR       1 to also tag + push to GHCR (default: 0)
-#   REGISTRY        GHCR path (default: ghcr.io/psidharth567/toolkit)
+#   TAG             Image tag (default: latest). Tagged locally as both
+#                   ${IMAGE_NAME}:<TAG> and toolkit/finetune:<TAG>.
+#   IMAGE_NAME      Registry image name (default: ghcr.io/psidharth567/finetune-library)
+#   PUSH_GHCR       1 to also push ${IMAGE_NAME}:<TAG> (default: 0; needs docker login ghcr.io)
 #   ALLOW_MISSING_WHEELS  Passed through as a Docker build ARG (default: 0)
 set -euo pipefail
 
 FINETUNE_LIBRARY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TAG="${1:-${TAG:-latest}}"
+IMAGE_NAME="${IMAGE_NAME:-ghcr.io/psidharth567/finetune-library}"
 LOCAL_TAG="toolkit/finetune:${TAG}"
+REMOTE_TAG="${IMAGE_NAME}:${TAG}"
 NODE="${NODE:-}"
 PUSH_GHCR="${PUSH_GHCR:-0}"
-REGISTRY="${REGISTRY:-ghcr.io/psidharth567/toolkit}"
 ALLOW_MISSING_WHEELS="${ALLOW_MISSING_WHEELS:-0}"
 
 build_cmd=$(cat <<CMD
@@ -30,6 +33,7 @@ echo "[build] context: \$(du -sh . 2>/dev/null | cut -f1) (before .dockerignore 
 time docker build \
   --build-arg ALLOW_MISSING_WHEELS=${ALLOW_MISSING_WHEELS} \
   -t "${LOCAL_TAG}" \
+  -t "${REMOTE_TAG}" \
   -f docker/Dockerfile \
   .
 echo "[build] image size:"
@@ -48,10 +52,8 @@ else
 fi
 
 if [[ "${PUSH_GHCR}" == "1" ]]; then
-  REMOTE_TAG="${REGISTRY}/finetune:${TAG}"
   push_cmd=$(cat <<CMD
 set -euo pipefail
-docker tag "${LOCAL_TAG}" "${REMOTE_TAG}"
 docker push "${REMOTE_TAG}"
 echo "[push] pushed ${REMOTE_TAG}"
 CMD
@@ -65,4 +67,4 @@ REMOTE
   fi
 fi
 
-echo "[build] done: ${LOCAL_TAG}"
+echo "[build] done: ${REMOTE_TAG} (also ${LOCAL_TAG})"

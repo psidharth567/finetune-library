@@ -16,7 +16,9 @@ set -euo pipefail
 CONFIG_PATH="${CONFIG_PATH:?set CONFIG_PATH to an experiment YAML}"
 
 # Optional overrides.
-FINETUNE_LIBRARY_ROOT="${FINETUNE_LIBRARY_ROOT:-/projects/data/llmteam/sidharth/toolkit/finetune-library}"
+# sbatch copies this script to a spool dir, so BASH_SOURCE is not the repo:
+# default to the submit dir (run `sbatch` from the repo root) or set it explicitly.
+FINETUNE_LIBRARY_ROOT="${FINETUNE_LIBRARY_ROOT:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 HF_HOME="${HF_HOME:-${PROJECT_ROOT}/.cache/huggingface}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"

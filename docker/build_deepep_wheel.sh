@@ -5,7 +5,7 @@ set -euo pipefail
 
 FINETUNE_LIBRARY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WHEEL_DIR="${WHEEL_DIR:-${FINETUNE_LIBRARY_ROOT}/wheels}"
-IMAGE="${FINETUNE_IMAGE:-toolkit/finetune:latest}"
+IMAGE="${FINETUNE_IMAGE:-ghcr.io/psidharth567/finetune-library:latest}"
 DEEPEP_COMMIT="${DEEPEP_COMMIT:-9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee}"
 HF_HOME="${HF_HOME:-${FINETUNE_LIBRARY_ROOT}/.cache/huggingface}"
 

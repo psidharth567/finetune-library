@@ -2,7 +2,6 @@ version: 1
 task: cpt
 model:
   name: gemma4-31b-it
-  cache_dir: /projects/data/llmteam/sidharth/sycophancy/eval/.cache/huggingface
 data:
   format: text
   path: data/cpt_train_longest_20k/train_packed_2048.jsonl

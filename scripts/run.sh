@@ -6,10 +6,11 @@
 #
 # Env:
 #   NODE              Optional. ssh to this host and run there. Unset = run
-#                      on the current host. Works from any bodhanai-node001..024.
-#   IMAGE             Docker image (default: toolkit/finetune:latest)
-#   HF_HOME           HF cache root on the host (default:
-#                      /projects/data/llmteam/sidharth/toolkit/finetune-library/.cache/huggingface)
+#                      on the current host. The repo path must be the same on
+#                      that host (shared filesystem).
+#   IMAGE             Docker image (default: ghcr.io/psidharth567/finetune-library:latest;
+#                      pulled automatically if not present locally)
+#   HF_HOME           HF cache root on the host (default: <repo>/.cache/huggingface)
 #   DATA_DIR          Extra host dir to bind-mount at /data (optional)
 #   EXTRA_MOUNTS      Extra `-v host:container[:ro]` args, space separated (optional)
 #   DEV               1 = bind-mount the live finetune-library source tree over
@@ -18,12 +19,12 @@
 #   HF_HUB_OFFLINE    1 = forbid HF hub network calls, fail loudly instead of
 #                      silently downloading if a pinned revision is missing
 #                      from cache (default: 1). Set 0 to allow downloads.
-#   LOG               Log file path (default: finetune-library/logs/run-<ts>.log)
+#   LOG               Log file path (default: <repo>/logs/run-<ts>.log)
 #   RUN_AS_ROOT       1 = skip --user (default: 0, runs as invoking uid:gid)
+#   HF_TOKEN          Forwarded if set (gated models; local runs only, not over NODE=)
 set -euo pipefail
 
 FINETUNE_LIBRARY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TOOLKIT_ROOT="$(cd "${FINETUNE_LIBRARY_ROOT}/.." && pwd)"
 
 CONFIG="${1:?usage: run.sh CONFIG [train|benchmark|prepare-data|merge ...]}"
 shift || true
@@ -32,7 +33,7 @@ shift || true
 EXTRA_ARGS=("$@")
 
 NODE="${NODE:-}"
-IMAGE="${IMAGE:-toolkit/finetune:latest}"
+IMAGE="${IMAGE:-ghcr.io/psidharth567/finetune-library:latest}"
 HF_HOME="${HF_HOME:-${FINETUNE_LIBRARY_ROOT}/.cache/huggingface}"
 DATA_DIR="${DATA_DIR:-}"
 EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
@@ -72,11 +73,14 @@ if [[ -n "${GPUS}" ]]; then
 fi
 
 MOUNT_ARGS=(
-  -v "${TOOLKIT_ROOT}:/projects_toolkit"
-  -v "/projects:/projects"
   -v "${HF_HOME}:/cache"
   -v "${RUNTIME_HOME}:/runtime_home"
 )
+# Shared-filesystem convenience: if the host has /projects, mount it at the
+# same path so absolute data/output paths in configs resolve unchanged.
+if [[ -d /projects ]]; then
+  MOUNT_ARGS+=(-v "/projects:/projects")
+fi
 if [[ -n "${DATA_DIR}" ]]; then
   MOUNT_ARGS+=(-v "${DATA_DIR}:/data")
 fi
@@ -109,6 +113,11 @@ done
 while IFS='=' read -r var _; do
   NCCL_ENV_ARGS+=(-e "${var}=${!var}")
 done < <(env | grep -E '^FINETUNE_[A-Z0-9_]+=' || true)
+# HF_TOKEN (gated models) is forwarded by name only, so its value never lands
+# in the generated command file. Local runs only: it is not carried over ssh.
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  NCCL_ENV_ARGS+=(-e HF_TOKEN)
+fi
 
 CONFIG_ARG="${CONFIG}"
 
