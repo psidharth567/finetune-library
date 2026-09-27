@@ -49,7 +49,7 @@ mkdir -p "$(dirname "${LOG}")" "${HF_HOME}"
 # non-root: containers have no home dir for an arbitrary host uid, so point
 # every cache env var at a host-mounted, already-writable location.
 RUNTIME_HOME="${FINETUNE_LIBRARY_ROOT}/.cache/container-home"
-mkdir -p "${RUNTIME_HOME}/triton" "${RUNTIME_HOME}/inductor" "${RUNTIME_HOME}/uv"
+mkdir -p "${RUNTIME_HOME}/triton" "${RUNTIME_HOME}/inductor" "${RUNTIME_HOME}/uv" "${FINETUNE_LIBRARY_ROOT}/outputs"
 
 INVOKER_UID="$(id -u)"
 INVOKER_GID="$(id -g)"
@@ -86,6 +86,14 @@ if [[ -n "${DATA_DIR}" ]]; then
 fi
 if [[ "${DEV}" == "1" ]]; then
   MOUNT_ARGS+=(-v "${FINETUNE_LIBRARY_ROOT}:/opt/toolkit/finetune-library")
+else
+  # Configs use repo-relative outputs/ and .cache/ (prepared data). The baked
+  # tree is read-only for a non-root --user and discarded by --rm, so back
+  # both with the host repo's dirs: writable, and results survive the run.
+  MOUNT_ARGS+=(
+    -v "${FINETUNE_LIBRARY_ROOT}/outputs:/opt/toolkit/finetune-library/outputs"
+    -v "${FINETUNE_LIBRARY_ROOT}/.cache:/opt/toolkit/finetune-library/.cache"
+  )
 fi
 if [[ -n "${EXTRA_MOUNTS}" ]]; then
   # shellcheck disable=SC2206
@@ -162,7 +170,7 @@ INNER_SCRIPT="set -euo pipefail; cd \"\${FINETUNE_LIBRARY_ROOT:-/opt/toolkit/fin
 
 run_cmd=$(cat <<CMD
 set -euo pipefail
-mkdir -p "${HF_HOME}" "${RUNTIME_HOME}/triton" "${RUNTIME_HOME}/inductor" "${RUNTIME_HOME}/uv"
+mkdir -p "${HF_HOME}" "${RUNTIME_HOME}/triton" "${RUNTIME_HOME}/inductor" "${RUNTIME_HOME}/uv" "${FINETUNE_LIBRARY_ROOT}/outputs"
 docker run ${DOCKER_ARGS_LINE} "${IMAGE}" bash -lc '${INNER_SCRIPT}' 2>&1 | tee "${LOG}"
 CMD
 )

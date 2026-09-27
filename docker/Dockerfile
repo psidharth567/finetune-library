@@ -68,6 +68,9 @@ COPY README.md AGENTS.md ./finetune-library/
 COPY configs ./finetune-library/configs
 COPY scripts ./finetune-library/scripts
 COPY tests ./finetune-library/tests
+# Only the small smoke fixtures (data/dummy_*.jsonl) pass .dockerignore; the
+# production configs point at data/dummy_cpt.jsonl, so bake them in.
+COPY data ./finetune-library/data
 COPY wheels/ /wheels/
 
 # Host source permissions can be arbitrarily restrictive (e.g. 700 dirs, 750

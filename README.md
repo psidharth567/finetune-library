@@ -112,8 +112,10 @@ scripts/run.sh _ merge --checkpoint outputs/qwen3-8b-cpt/final --output outputs/
 | `RUN_AS_ROOT` | `0` | `1` skips `--user`, runs as root inside the container |
 | `HF_TOKEN` | unset | forwarded if set (gated models); local runs only, not over `NODE=` |
 
-`scripts/run.sh` mounts the repo's `HF_HOME` at `/cache` (plus `/projects` at
-the same path, if the host has it — for shared-filesystem clusters), runs as your
+`scripts/run.sh` mounts the repo's `HF_HOME` at `/cache`, the repo's `outputs/`
+and `.cache/` over the baked tree (so repo-relative `output_dir` and prepared
+data land on the host), plus `/projects` at the same path if the host has it
+(for shared-filesystem clusters). It runs as your
 invoking uid:gid by default (so outputs aren't root-owned), forwards NCCL env
 vars and every `FINETUNE_*` env var that's set on the host, and uses
 `--gpus all --ipc=host --ulimit memlock=-1 --shm-size=64g` (or `GPUS=...` for

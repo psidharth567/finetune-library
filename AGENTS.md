@@ -51,7 +51,8 @@ Baked into the image at `/opt/toolkit/finetune-library`:
 `/opt/toolkit/finetune-library` for iterating on library code without
 rebuilding.
 
-`scripts/run.sh` runs as the invoking host uid:gid by default
+`scripts/run.sh` bind-mounts the repo's `outputs/` and `.cache/` over the
+baked tree, so run outputs land on the host. It runs as the invoking host uid:gid by default
 (`RUN_AS_ROOT=1` to skip that), forwards NCCL env vars and every `FINETUNE_*`
 env var set on the host, and sets `HF_HUB_OFFLINE=1` inside the container by
 default (fails loudly on a missing pinned revision instead of downloading).
