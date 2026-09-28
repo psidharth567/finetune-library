@@ -16,6 +16,7 @@ hf_ep/
 data/*
 !data/dummy_cpt.jsonl
 !data/dummy_sft.jsonl
+!data/dummy_dpo.jsonl
 
 # Wheels are COPYed explicitly by the Dockerfile from a fixed set of files;
 # do not exclude the directory itself.
