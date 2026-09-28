@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
+import sys
+import traceback
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -148,8 +151,20 @@ class DistributedContext:
         torch._foreach_mul_(local_gradients, coefficient)
         return total_norm
 
-    def close(self) -> None:
+    def close(self, *, failed: bool = False) -> None:
         if self.initialized_here and dist.is_initialized():
+            if failed and self.world_size > 1:
+                # Any NCCL teardown can block forever once a rank has failed:
+                # after a CUDA OOM inside an NCCL all-reduce (Qwen3.5-35B EP4),
+                # destroy_process_group() and _abort_process_group() both hung
+                # every rank with the exception never printed. Report the
+                # exception now and exit this rank; torchrun sees the failed
+                # child and stops the others.
+                traceback.print_exc()
+                logging.shutdown()
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
             # Successful training already synchronizes before returning.
             # A barrier here can deadlock or mask the root exception when one
             # rank has failed (for example, after a CUDA OOM).

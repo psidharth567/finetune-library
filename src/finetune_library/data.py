@@ -636,8 +636,57 @@ def cache_key(config: ExperimentConfig, tokenizer: Any) -> str:
     if config.task == Task.SFT:
         identity["sft_preparation_version"] = SFT_PREPARATION_VERSION
         identity["packing_isolation"] = config.packing_isolation()
+    if config.task == Task.DPO:
+        from finetune_library.dpo import PREFERENCE_PREPARATION_VERSION
+
+        assert config.preference is not None
+        identity["preference_preparation_version"] = PREFERENCE_PREPARATION_VERSION
+        identity["preference_fields"] = [
+            config.preference.chosen_field,
+            config.preference.rejected_field,
+        ]
     payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()[:20]
+
+
+def source_fingerprint(data: DataConfig) -> dict[str, Any] | None:
+    """Size and mtime of a local data file; None for directories and hub datasets.
+
+    The cache key covers the data *config* (path, fields, ...), not the file's
+    contents, so a file rewritten in place would silently reuse stale prepared
+    data. The fingerprint is stored with the prepared data and checked on reuse.
+    """
+
+    if data.path is None:
+        return None
+    path = Path(data.path)
+    if not path.is_file():
+        return None
+    stat = path.stat()
+    return {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def check_prepared_source(config: ExperimentConfig, destination: Path) -> None:
+    """Fail loudly if the source file changed since `destination` was prepared.
+
+    Prepared data without a recorded fingerprint (older caches) is reused as
+    before.
+    """
+
+    metadata_path = destination / "finetune_library_metadata.json"
+    if not metadata_path.exists():
+        return
+    recorded = json.loads(metadata_path.read_text(encoding="utf-8")).get("source")
+    current = source_fingerprint(config.data)
+    if recorded is None or current is None:
+        return
+    if (recorded["size"], recorded["mtime_ns"]) != (current["size"], current["mtime_ns"]):
+        raise ValueError(
+            f"{config.data.path} changed since it was prepared into {destination} "
+            f"(size {recorded['size']} -> {current['size']}, mtime changed). The cache key "
+            "covers the data config, not the file contents: delete that directory to "
+            "re-prepare, or write the new data to a new path"
+        )
 
 
 def prepare_to_disk(
@@ -654,8 +703,15 @@ def prepare_to_disk(
     )
     marker = destination / "dataset_info.json"
     if marker.exists():
+        check_prepared_source(config, destination)
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if config.task == Task.DPO:
+        from finetune_library.dpo import prepare_preference_to_disk
+
+        return prepare_preference_to_disk(
+            config, tokenizer, destination, cache_key(config, tokenizer)
+        )
     # Collect with stats
     raw_count = 0
     truncated_count = 0
@@ -713,6 +769,7 @@ def prepare_to_disk(
     dataset.save_to_disk(str(destination))
     metadata = {
         "cache_key": cache_key(config, tokenizer),
+        "source": source_fingerprint(config.data),
         "rows": len(dataset),
         "max_seq_length": config.training.max_seq_length,
         "stats": {
@@ -765,6 +822,7 @@ def _save_sft_prepared(
     dataset.save_to_disk(str(destination))
     metadata = {
         "cache_key": cache_key(config, tokenizer),
+        "source": source_fingerprint(config.data),
         "rows": len(dataset),
         "max_seq_length": max_len,
         "stats": stats,
@@ -780,11 +838,11 @@ def _save_sft_prepared(
     return destination
 
 
-def load_prepared(path: str | Path):
+def load_prepared(path: str | Path, required_columns: Sequence[str] = ("input_ids", "labels")):
     from datasets import load_from_disk
 
     dataset = load_from_disk(str(path))
-    required = {"input_ids", "labels"}
+    required = set(required_columns)
     columns = set(getattr(dataset, "column_names", ()))
     if not required.issubset(columns):
         raise ValueError(f"prepared dataset is missing columns: {sorted(required - columns)}")

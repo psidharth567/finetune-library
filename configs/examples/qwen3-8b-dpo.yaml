@@ -1,0 +1,36 @@
+# Offline DPO on preference pairs (see README "DPO").
+# Rows: {"prompt": str | messages, "chosen": str | messages, "rejected": str | messages}.
+# Tulu/Olmo preference sets (chosen/rejected as full [user, assistant] lists) load as-is.
+version: 1
+task: dpo
+model:
+  name: qwen3-8b
+data:
+  format: preference
+  path: data/dummy_dpo.jsonl
+  cache_dir: .cache/prepared
+  sft_overlength: drop        # pairs with a side longer than max_seq_length are dropped, never truncated
+training:
+  output_dir: outputs/qwen3-8b-dpo
+  max_seq_length: 2048        # per sequence (chosen and rejected each)
+  per_device_batch_size: 2    # pairs per micro-batch
+  gradient_accumulation_steps: 2
+  max_steps: 4
+  log_every_steps: 1
+preference:
+  beta: 0.1
+  loss_type: sigmoid
+lora: {rank: 32, alpha: 64, dropout: 0.0, expert_rank: 4}
+optimizer:
+  name: adamw
+  learning_rate: 5.0e-6
+scheduler: {name: cosine, warmup_ratio: 0.1}
+distributed: {strategy: ddp}
+runtime:
+  backend: native
+  attention: flash_attention_2
+  model_kernels: auto
+  loss: auto
+  torch_compile: false
+  gradient_checkpointing: true
+checkpoint: {save_every_steps: 0, save_final: true}

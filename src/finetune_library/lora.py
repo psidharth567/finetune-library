@@ -161,6 +161,7 @@ def _grouped_local_expert_compute(
     expert_ids: torch.Tensor,
     weights: torch.Tensor,
     global_offset: int,
+    use_adapter: bool = True,
 ) -> torch.Tensor:
     if hidden_states.numel() == 0:
         return hidden_states
@@ -183,11 +184,13 @@ def _grouped_local_expert_compute(
     offsets = counts.cumsum(0, dtype=torch.int32)
 
     gate_up = _grouped_linear(sorted_hidden, base.gate_up_proj, offsets)
-    gate_up = gate_up + _grouped_expert_delta(gate_wrapper, sorted_hidden, offsets)
+    if use_adapter:
+        gate_up = gate_up + _grouped_expert_delta(gate_wrapper, sorted_hidden, offsets)
     gate, up = gate_up.chunk(2, dim=-1)
     intermediate = base.act_fn(gate) * up
     current = _grouped_linear(intermediate, base.down_proj, offsets)
-    current = current + _grouped_expert_delta(down_wrapper, intermediate, offsets)
+    if use_adapter:
+        current = current + _grouped_expert_delta(down_wrapper, intermediate, offsets)
     sorted_weights = weights[permutation]
     current = current * sorted_weights.unsqueeze(-1)
     return current[inverse]
@@ -214,8 +217,11 @@ def _install_active_expert_forward(
             *args: Any,
             **kwargs: Any,
         ) -> torch.Tensor:
-            if self.disable_adapters or self.merged:
+            if self.merged:
                 return super().forward(x, *args, **kwargs)
+            # Adapters off (the DPO reference pass): same kernels, no deltas, so
+            # a zero adapter reproduces the reference exactly.
+            use_adapter = not self.disable_adapters
             if len(args) < 2:
                 raise TypeError("Gemma expert LoRA requires indices and routing weights")
             top_k_index, top_k_weights, *remaining_args = args
@@ -233,15 +239,17 @@ def _install_active_expert_forward(
                 top_k_position, token_index = torch.where(expert_mask[expert_index])
                 current = hidden_states[token_index]
                 gate_up = F.linear(current, base.gate_up_proj[expert_index])
-                gate_up = gate_up + _active_expert_delta(gate_wrapper, current, expert_index)
+                if use_adapter:
+                    gate_up = gate_up + _active_expert_delta(gate_wrapper, current, expert_index)
                 gate, up = gate_up.chunk(2, dim=-1)
                 intermediate = base.act_fn(gate) * up
                 current = F.linear(intermediate, base.down_proj[expert_index])
-                current = current + _active_expert_delta(
-                    down_wrapper,
-                    intermediate,
-                    expert_index,
-                )
+                if use_adapter:
+                    current = current + _active_expert_delta(
+                        down_wrapper,
+                        intermediate,
+                        expert_index,
+                    )
                 current = current * top_k_weights[token_index, top_k_position, None]
                 final.index_add_(0, token_index, current.to(dtype=final.dtype))
             return final
@@ -253,8 +261,15 @@ def _install_active_expert_forward(
             *args: Any,
             **kwargs: Any,
         ) -> torch.Tensor:
-            if self.disable_adapters or self.merged:
+            expert_parallel = moe_layout is not None and moe_layout.enabled
+            if self.merged and not expert_parallel:
                 return super().forward(x, *args, **kwargs)
+            # Adapters off (the DPO reference pass): same kernels, no deltas, so
+            # a zero adapter reproduces the reference exactly. PEFT's stock
+            # forward would use a different expert kernel and, under EP, skip
+            # the all-to-all over this rank's expert shard. Merged weights
+            # already contain the deltas.
+            use_adapter = not (self.disable_adapters or self.merged)
             if len(args) < 2:
                 raise TypeError("Gemma expert LoRA requires indices and routing weights")
             top_k_index, top_k_weights, *remaining_args = args
@@ -262,7 +277,8 @@ def _install_active_expert_forward(
                 raise TypeError("unexpected arguments for Gemma expert LoRA")
             base, gate_wrapper, down_wrapper = _expert_layers(self)
 
-            if moe_layout is not None and moe_layout.enabled:
+            if expert_parallel:
+                assert moe_layout is not None
                 def local_forward(
                     recv_hidden: torch.Tensor,
                     recv_expert_ids: torch.Tensor,
@@ -281,6 +297,7 @@ def _install_active_expert_forward(
                         recv_expert_ids,
                         recv_weights,
                         expert_offset,
+                        use_adapter=use_adapter,
                     )
 
                 return expert_parallel_forward(
@@ -311,19 +328,21 @@ def _install_active_expert_forward(
             offsets = counts.cumsum(0, dtype=torch.int32)
 
             gate_up = _grouped_linear(current, base.gate_up_proj, offsets)
-            gate_up = gate_up + _grouped_expert_delta(
-                gate_wrapper,
-                current,
-                offsets,
-            )
+            if use_adapter:
+                gate_up = gate_up + _grouped_expert_delta(
+                    gate_wrapper,
+                    current,
+                    offsets,
+                )
             gate, up = gate_up.chunk(2, dim=-1)
             intermediate = base.act_fn(gate) * up
             current = _grouped_linear(intermediate, base.down_proj, offsets)
-            current = current + _grouped_expert_delta(
-                down_wrapper,
-                intermediate,
-                offsets,
-            )
+            if use_adapter:
+                current = current + _grouped_expert_delta(
+                    down_wrapper,
+                    intermediate,
+                    offsets,
+                )
             sorted_weights = top_k_weights.reshape(-1)[permutation]
             current = current * sorted_weights.unsqueeze(-1)
             current = current[inverse].reshape(num_tokens, top_k, hidden_dim)

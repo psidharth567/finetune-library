@@ -17,10 +17,10 @@ def _config_parser(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="finetune-lib",
-        description="Cross-project CPT and SFT LoRA trainer",
+        description="Cross-project CPT, SFT, and DPO LoRA trainer",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
-    _config_parser(subcommands.add_parser("train", help="Run CPT or SFT"))
+    _config_parser(subcommands.add_parser("train", help="Run CPT, SFT, or DPO"))
 
     prepare = subcommands.add_parser("prepare-data", help="Tokenize and pack a dataset")
     _config_parser(prepare)

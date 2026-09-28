@@ -1,7 +1,7 @@
 # finetune-lib
 
-LoRA toolkit for continual pretraining (CPT) and supervised finetuning (SFT)
-on a single 8×GPU node: DDP, FSDP/HSDP, and MoE expert parallelism, with
+LoRA toolkit for continual pretraining (CPT), supervised finetuning (SFT), and
+offline direct preference optimization (DPO) on a single 8×GPU node: DDP, FSDP/HSDP, and MoE expert parallelism, with
 pinned model revisions and a prebuilt kernel stack (FA2/FA3, Liger, FLA,
 DeepEP).
 
@@ -127,7 +127,7 @@ a subset).
 |---|---|
 | `finetune-lib init` | Scaffold project config and directories |
 | `finetune-lib prepare-data` | Tokenize and pack dataset |
-| `finetune-lib train` | Run training |
+| `finetune-lib train` | Run training (CPT, SFT, or DPO) |
 | `finetune-lib benchmark` | Measure throughput (warmup + measured steps) |
 | `finetune-lib merge` | Merge adapter into base weights |
 
@@ -231,6 +231,58 @@ real-model check: `tests/multigpu/packed_sft_parity.py`.
 Under sdpa/eager the packed mask is a dense L x L boolean over the flattened
 batch (L = per_device_batch_size x max_seq_length), so prefer flash attention
 for long SFT sequences.
+
+## DPO (offline preference optimization)
+
+`task: dpo` trains a LoRA adapter on fixed (prompt, chosen, rejected) pairs
+(Rafailov et al. 2023). No generation happens during training. Example:
+`configs/examples/qwen3-8b-dpo.yaml`.
+
+- **Data** (`data.format: preference`, JSONL): `prompt` is a string or a
+  message list; `chosen`/`rejected` are response strings or message lists.
+  Tulu/Olmo preference sets, whose `chosen`/`rejected` repeat the prompt
+  turns as `[user, assistant]`, load as-is. Both sides must share the same
+  prompt. Only the final assistant turn is supervised.
+- **Never truncated.** A pair with either side longer than
+  `training.max_seq_length` is dropped (`data.sft_overlength: drop`) or
+  rejected (`error`). Pairs whose two sides tokenize identically are dropped.
+  Check `prep_stats.json` after `prepare-data`.
+- **Reference model = the frozen base.** The adapter is switched off for a
+  no-grad reference pass, so no second copy of the weights is held. The
+  reference runs the same kernels as the policy minus the LoRA deltas, so a
+  fresh adapter starts at loss exactly ln 2 with margin 0.
+- **Batches** are padding-free: each micro-batch of
+  `per_device_batch_size` pairs becomes one row with per-sequence
+  `position_ids` (the isolated layout packed SFT uses). The LM head only
+  sees supervised positions, in `preference.logprob_chunk_tokens` chunks.
+- **Loss** (`preference:`): `beta` (0.1), `loss_type` `sigmoid | ipo | hinge`,
+  `label_smoothing` (sigmoid only), and `sft_weight` (NLL on chosen, off).
+  The loss is averaged over pairs across all ranks.
+- **Metrics** (`metrics.jsonl`) are pair means: `rewards_chosen`,
+  `rewards_rejected`, `rewards_margin`, `rewards_accuracy`, `logps_chosen`,
+  `logps_rejected`, plus `pairs`/`pairs_per_second`. `tokens` counts chosen
+  and rejected input tokens; each gets a reference and a policy forward.
+- **Not supported yet:** `runtime.torch_compile`,
+  `runtime.loss: fused_linear_cross_entropy` (the fused kernel assumes
+  uniform token weights), and `flex_attention`.
+
+Pairs can come from any source. `scripts/build_pairs.py` (standard library
+only) turns `inference batch` outputs into pairs, either best vs worst of N
+samples under a reward file (the same file grpo-library takes as
+`reward.path`), or strong vs weak model responses (Olmo 3 "delta learning").
+
+Measured on 8xH100, Qwen3-8B DDP, FA2, gradient checkpointing, LoRA r32. One
+epoch was 8,024 Olmo-2 13B preference pairs (the first 8,192 rows of one
+shuffled shard), `max_seq_length` 4096, 128 pairs per step, lr 5e-5,
+beta 0.1, `logprob_chunk_tokens` 1024. It ran at 38k tok/s median with a
+24.7 GiB peak. Held-out reward accuracy on 1,009 unseen pairs from the same
+shard was 76.4%, and loss went from 0.693 to 0.501. The base-model control is
+exactly ln 2 by construction.
+
+Qwen3.5-35B-A3B FSDP+EP4 (FA3, gradient checkpointing, 1024 tokens per side)
+fits at 74 GiB with the default `logprob_chunk_tokens: 256`; 1024 ran out of
+memory. It is close to the 80 GiB limit, so lower `max_seq_length` or the
+chunk if it fails.
 
 ## Opt-in knobs (off by default)
 

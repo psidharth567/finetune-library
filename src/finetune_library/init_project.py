@@ -17,6 +17,8 @@ def _default_runtime_backend(model_name: str) -> str:
 
 
 def _default_data_format(task: Task) -> DataFormat:
+    if task == Task.DPO:
+        return DataFormat.PREFERENCE
     return DataFormat.TEXT if task == Task.CPT else DataFormat.MESSAGES
 
 
@@ -47,6 +49,8 @@ def scaffold_project_config(
 
     spec = resolve_model(model_name)
     lr = spec.recommended_lr_cpt if task == Task.CPT else spec.recommended_lr_sft
+    if task == Task.DPO:
+        lr = spec.recommended_lr_sft / 10
     # Hard-optimized defaults: liger auto, fused loss, grouped_mm for MoE, no ckpt where memory-safe (<=26B)
     is_large = "32b" in model_name.lower() or "31b" in model_name.lower()
     grad_ckpt = True if is_large else False
@@ -92,7 +96,7 @@ def scaffold_project_config(
             "backend": hard_backend,
             "attention": "sdpa",
             "model_kernels": "auto",
-            "loss": "fused_linear_cross_entropy",
+            "loss": "auto" if task == Task.DPO else "fused_linear_cross_entropy",
             "experts": experts_default,
             "torch_compile": False,
             "gradient_checkpointing": grad_ckpt,

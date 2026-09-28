@@ -1,6 +1,6 @@
 # finetune-lib — Agent instructions
 
-LoRA CPT/SFT toolkit. This is a standalone repo — all paths below are
+LoRA CPT/SFT/DPO toolkit. This is a standalone repo — all paths below are
 relative to the repo root.
 
 ## Toolkit location
@@ -75,11 +75,11 @@ Stack: Python 3.12, PyTorch 2.11+cu129, Transformers 5.5, PEFT 0.19, Liger 0.8.1
 finetune_request:
   project_root: /absolute/path/to/project
   run_name: descriptive-run-name
-  task: cpt | sft
+  task: cpt | sft | dpo
   model: <registry-key>
   data:
     path: /absolute/path/to/data.jsonl
-    format: text | messages | alpaca | prompt_completion | tokenized
+    format: text | messages | alpaca | prompt_completion | tokenized | preference
   training:
     max_steps: 500
     max_seq_length: 2048
@@ -214,6 +214,18 @@ or rejected (`error`) — packed or not. Example:
 `configs/examples/qwen3-8b-sft-packed.yaml`. Check `prep_stats.json`
 (`dropped_overlength`, `examples_per_window`, `avg_fill_pct`) after
 `prepare-data`.
+
+## DPO
+
+`task: dpo` + `data.format: preference` runs offline DPO on
+`{"prompt", "chosen", "rejected"}` rows (strings or message lists; Olmo/Tulu
+layouts load as-is). See README "DPO" and `configs/examples/qwen3-8b-dpo.yaml`.
+The reference is the base model (adapter disabled, no grad); a fresh adapter
+must log step-1 `loss` = 0.6931472 and `rewards_margin` = 0. Treat any other
+value as a bug. Pairs are never truncated (`dropped_overlength` in
+`prep_stats.json`). Unsupported: `torch_compile`,
+`loss: fused_linear_cross_entropy`, `flex_attention`. Build pairs from
+`inference batch` output with `scripts/build_pairs.py` (stdlib only).
 
 ## Do not
 

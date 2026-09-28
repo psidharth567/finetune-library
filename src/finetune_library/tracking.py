@@ -29,7 +29,7 @@ class TrackingSession:
             name=config.logging.wandb.run_name or output_name,
             group=config.logging.wandb.group,
             tags=list(config.logging.wandb.tags),
-            config=config.model_dump(mode="json"),
+            config=config.to_json_dict(),
             dir=str(Path(config.training.output_dir)),
         )
         self._active = True

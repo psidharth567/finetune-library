@@ -4,6 +4,7 @@ import json
 import math
 import random
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,13 +19,20 @@ from finetune_library.checkpoint import (
     save_adapter,
     save_checkpoint,
 )
-from finetune_library.config import DataFormat, ExperimentConfig
+from finetune_library.config import DataFormat, ExperimentConfig, Task
 from finetune_library.data import (
     CausalCollator,
     cache_key,
     count_loss_tokens,
     load_prepared,
     prepare_to_disk,
+)
+from finetune_library.dpo import (
+    PREFERENCE_COLUMNS,
+    STAT_NAMES,
+    PreferenceCollator,
+    PreferenceModel,
+    count_pairs,
 )
 from finetune_library.distributed import (
     DistributedContext,
@@ -63,6 +71,8 @@ class PendingStepMetric:
     cpu_seconds: float
     start_event: Any = None
     end_event: Any = None
+    # task=dpo: global sums of dpo.STAT_NAMES; global_tokens then counts pairs.
+    preference_sums: torch.Tensor | None = None
 
     def resolve(self, device: torch.device) -> dict[str, Any]:
         if self.end_event is not None:
@@ -83,7 +93,7 @@ class PendingStepMetric:
             grad_norm is not None and not math.isfinite(grad_norm)
         ):
             raise FloatingPointError(f"non-finite training state at step {self.step}")
-        return {
+        metric = {
             "step": self.step,
             "loss": loss,
             "learning_rate": self.learning_rate,
@@ -105,6 +115,19 @@ class PendingStepMetric:
             "warmup": self.warmup,
             "elapsed_seconds": time.perf_counter() - self.started_at,
         }
+        if self.preference_sums is not None:
+            sums = dict(zip(STAT_NAMES, self.preference_sums.tolist(), strict=True))
+            processed = sums.pop("tokens")
+            sums.pop("loss")  # already reported as the global pair mean
+            metric["pairs"] = int(tokens)
+            metric["pairs_per_second"] = tokens / step_seconds
+            # Input tokens of every chosen and rejected sequence (each runs a
+            # reference and a policy forward).
+            metric["tokens"] = int(processed)
+            metric["tokens_per_second"] = processed / step_seconds
+            for name, value in sums.items():
+                metric[name] = value / tokens
+        return metric
 
 
 def _seed_everything(seed: int, rank: int) -> None:
@@ -119,6 +142,12 @@ def _prepare_dataset(
     tokenizer: Any,
     context: DistributedContext,
 ):
+    if config.task == Task.DPO:
+        prepared = Path(config.data.cache_dir) / cache_key(config, tokenizer)
+        if context.is_main:
+            prepare_to_disk(config, tokenizer, prepared)
+        context.barrier()
+        return load_prepared(prepared, PREFERENCE_COLUMNS)
     source = Path(config.data.path) if config.data.path else None
     is_prepared = (
         config.data.format == DataFormat.TOKENIZED
@@ -156,12 +185,17 @@ def _make_loader(
         )
         shuffle = False
     workers = config.training.dataloader_workers
+    collate_fn: Any = (
+        PreferenceCollator()
+        if config.task == Task.DPO
+        else CausalCollator(tokenizer, config.training.max_seq_length, packing_isolation=config.packing_isolation())
+    )
     loader = DataLoader(
         dataset,
         batch_size=config.training.per_device_batch_size,
         sampler=sampler,
         shuffle=shuffle,
-        collate_fn=CausalCollator(tokenizer, config.training.max_seq_length, packing_isolation=config.packing_isolation()),
+        collate_fn=collate_fn,
         num_workers=workers,
         pin_memory=context.device.type == "cuda",
         persistent_workers=workers > 0,
@@ -284,7 +318,12 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                 flush=True,
             )
 
-        training_model = build_training_model(peft_model, config.runtime.loss)
+        dpo = config.task == Task.DPO
+        if dpo:
+            assert config.preference is not None
+            training_model: Any = PreferenceModel(peft_model, config.preference)
+        else:
+            training_model = build_training_model(peft_model, config.runtime.loss)
         # For FSDP/HSDP, compile before sharding to avoid Dynamo tracing
         # FSDP's fully_shard hooks (HSDP hang). DDP can compile after wrap.
         is_sharded = context.strategy in (context.strategy.HSDP, context.strategy.FSDP) if hasattr(context.strategy, "HSDP") else str(context.strategy) in ("hsdp", "fsdp")
@@ -389,7 +428,9 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                 data_seconds = time.perf_counter() - data_started
                 position.batch_in_epoch += len(batches)
 
-                local_tokens = sum(int(count_loss_tokens(batch).item()) for batch in batches)
+                # Loss normalization unit: supervised tokens (CPT/SFT) or pairs (DPO).
+                count_units = count_pairs if dpo else count_loss_tokens
+                local_tokens = sum(int(count_units(batch).item()) for batch in batches)
                 tokens = torch.tensor(
                     float(local_tokens), device=context.device, dtype=torch.float32
                 )
@@ -409,6 +450,11 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                     start_event.record()
                 local_loss_sum = torch.zeros(
                     (), device=context.device, dtype=torch.float32
+                )
+                local_preference_sums = (
+                    torch.zeros(len(STAT_NAMES), device=context.device, dtype=torch.float32)
+                    if dpo
+                    else None
                 )
                 for micro_index, cpu_batch in enumerate(batches):
                     batch = _move_batch(cpu_batch, context.device)
@@ -432,7 +478,12 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                         if output.loss is None:
                             raise RuntimeError("model did not return a training loss")
                         output.loss.backward()
-                        local_loss_sum.add_(output.loss.detach().float() * denominator)
+                        if local_preference_sums is not None:
+                            stats = training_model.last_stats
+                            local_preference_sums.add_(stats)
+                            local_loss_sum.add_(stats[0])  # fp32 per-pair loss sum
+                        else:
+                            local_loss_sum.add_(output.loss.detach().float() * denominator)
 
                 context.sync_replicated_gradients()
                 consolidate_tied_lora_gradients(model)
@@ -451,6 +502,8 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                 position.step += 1
 
                 context.reduce_data_parallel(local_loss_sum)
+                if local_preference_sums is not None:
+                    context.reduce_data_parallel(local_preference_sums)
                 warmup = benchmark and (position.step <= config.training.benchmark_warmup_steps)
                 pending_metrics.append(
                     PendingStepMetric(
@@ -465,6 +518,7 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                         cpu_seconds=cpu_seconds,
                         start_event=start_event,
                         end_event=end_event,
+                        preference_sums=local_preference_sums,
                     )
                 )
                 save_every = config.checkpoint.save_every_steps
@@ -577,4 +631,5 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
         return summary
     finally:
         tracking.finish()
-        context.close()
+        # sys.exc_info() is set here only while an exception is propagating.
+        context.close(failed=sys.exc_info()[0] is not None)

@@ -95,9 +95,11 @@ def test_one_loop_handles_cpt_optimizer_metrics_and_adapter(tmp_path: Path, monk
     ).bfloat16()
     tokenizer = TinyTokenizer()
 
-    def fake_runtime(*_args, **_kwargs) -> LoadedRuntime:
+    def fake_runtime(_config, _spec, context, *_args, **_kwargs) -> LoadedRuntime:
+        # Like load_runtime, place the model on the context device (CUDA when
+        # a GPU is visible; the test failed there with a CPU-only model).
         return LoadedRuntime(
-            model=model,
+            model=model.to(context.device),
             tokenizer=tokenizer,
             backend=config.runtime.backend,
             attention="eager",

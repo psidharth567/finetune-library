@@ -16,6 +16,7 @@ class StrictModel(BaseModel):
 class Task(StrEnum):
     CPT = "cpt"
     SFT = "sft"
+    DPO = "dpo"
 
 
 class DataFormat(StrEnum):
@@ -24,6 +25,7 @@ class DataFormat(StrEnum):
     MESSAGES = "messages"
     PROMPT_COMPLETION = "prompt_completion"
     ALPACA = "alpaca"
+    PREFERENCE = "preference"
 
 
 class DistributedStrategy(StrEnum):
@@ -109,6 +111,37 @@ class DataConfig(StrictModel):
             raise ValueError("data.chunk_overlap requires data.chunk_long_examples=true")
         if self.chunk_overlap and self.chunk_strategy != "sliding_window":
             raise ValueError("data.chunk_overlap requires data.chunk_strategy=sliding_window")
+        return self
+
+
+class PreferenceConfig(StrictModel):
+    """Direct preference optimization (task=dpo) settings.
+
+    The reference policy is the frozen base model: the LoRA adapter is
+    disabled for the reference forward pass, so no second model copy is held.
+    """
+
+    beta: Annotated[float, Field(gt=0.0)] = 0.1
+    # sigmoid: Rafailov et al. 2023; ipo: Azar et al. 2023 (length-normalized
+    # log-probs, as in the paper and TRL); hinge: SLiC-style.
+    loss_type: Literal["sigmoid", "ipo", "hinge"] = "sigmoid"
+    # Conservative DPO (sigmoid only): probability the preference label is flipped.
+    label_smoothing: Annotated[float, Field(ge=0.0, lt=0.5)] = 0.0
+    # Optional NLL on the chosen response (per-token mean per pair), RPO-style.
+    sft_weight: Annotated[float, Field(ge=0.0)] = 0.0
+    # Row fields. `data.prompt_field` names the prompt; chosen/rejected are
+    # either response strings or message lists (with or without the prompt turns).
+    chosen_field: str = "chosen"
+    rejected_field: str = "rejected"
+    # Log-prob chunk (tokens) for the LM head; bounds peak logits memory.
+    # 1024 OOMed Qwen3.5-35B-A3B EP4 (248k vocab); 256 fits (74 GiB) and cost
+    # Qwen3-8B 0.7% tok/s vs 1024 (8xH100, 50 measured steps).
+    logprob_chunk_tokens: PositiveInt = 256
+
+    @model_validator(mode="after")
+    def validate_loss(self) -> PreferenceConfig:
+        if self.label_smoothing and self.loss_type != "sigmoid":
+            raise ValueError("preference.label_smoothing only applies to loss_type=sigmoid")
         return self
 
 
@@ -268,6 +301,19 @@ class ExperimentConfig(StrictModel):
     runtime: RuntimeConfig = RuntimeConfig()
     checkpoint: CheckpointConfig = CheckpointConfig()
     logging: LoggingConfig = LoggingConfig()
+    # task=dpo only; None for CPT/SFT (and omitted from resolved configs then).
+    preference: PreferenceConfig | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_preference(cls, values: object) -> object:
+        if (
+            isinstance(values, dict)
+            and values.get("task") in (Task.DPO, Task.DPO.value)
+            and values.get("preference") is None
+        ):
+            return {**values, "preference": {}}
+        return values
 
     @model_validator(mode="before")
     @classmethod
@@ -302,6 +348,9 @@ class ExperimentConfig(StrictModel):
         """
         if self.task == Task.SFT and self.data.packing:
             return "attention"
+        if self.task == Task.DPO:
+            # DPO batches are always padding-free with per-sequence position_ids.
+            return "attention"
         return self.data.packing_isolation
 
     @model_validator(mode="after")
@@ -313,6 +362,11 @@ class ExperimentConfig(StrictModel):
             DataFormat.ALPACA,
             DataFormat.TOKENIZED,
         }
+        if self.preference is not None and self.task != Task.DPO:
+            raise ValueError("the preference block only applies to task=dpo")
+        if self.task == Task.DPO:
+            self._validate_dpo()
+            return self
         allowed = cpt_formats if self.task == Task.CPT else sft_formats
         if self.data.format not in allowed:
             raise ValueError(
@@ -336,13 +390,37 @@ class ExperimentConfig(StrictModel):
             )
         return self
 
+    def _validate_dpo(self) -> None:
+        if self.data.format != DataFormat.PREFERENCE:
+            raise ValueError("task=dpo requires data.format=preference")
+        if self.runtime.loss == "fused_linear_cross_entropy":
+            raise ValueError(
+                "task=dpo computes per-sequence log-probs itself; the fused LoRA "
+                "cross-entropy kernel assumes uniform token weights. Use runtime.loss=auto"
+            )
+        if self.runtime.torch_compile:
+            raise ValueError("task=dpo is not validated with runtime.torch_compile yet")
+        if self.runtime.attention == "flex_attention":
+            raise ValueError(
+                "task=dpo uses padding-free batches (packed position_ids), which are "
+                "not supported with runtime.attention=flex_attention"
+            )
+        if self.data.chunk_long_examples:
+            raise ValueError("data.chunk_long_examples does not apply to task=dpo")
+
     def effective_learning_rate(self) -> float:
         if self.optimizer.learning_rate is not None:
             return self.optimizer.learning_rate
         from finetune_library.registry import resolve_model
 
         spec = resolve_model(self.model.name)
-        return spec.recommended_lr_cpt if self.task == Task.CPT else spec.recommended_lr_sft
+        if self.task == Task.CPT:
+            return spec.recommended_lr_cpt
+        if self.task == Task.DPO:
+            # DPO moves a policy away from its reference; SFT-scale LoRA rates
+            # overshoot. No per-model DPO presets are measured yet.
+            return spec.recommended_lr_sft / 10
+        return spec.recommended_lr_sft
 
     def resolved_optimizer_config(self) -> OptimizerConfig:
         if self.optimizer.learning_rate is not None:
@@ -362,9 +440,16 @@ class ExperimentConfig(StrictModel):
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
-            json.dumps(self.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
+            json.dumps(self.to_json_dict(), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    def to_json_dict(self) -> dict[str, object]:
+        """JSON dump; CPT/SFT configs omit the DPO-only preference block."""
+        dumped = self.model_dump(mode="json")
+        if self.preference is None:
+            dumped.pop("preference")
+        return dumped
 
     def with_model_revision(self, revision: str) -> ExperimentConfig:
         return self.model_copy(

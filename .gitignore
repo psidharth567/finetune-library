@@ -17,3 +17,4 @@ data/*tokenized*/
 # Keep small checked-in fixtures.
 !data/dummy_cpt.jsonl
 !data/dummy_sft.jsonl
+!data/dummy_dpo.jsonl
