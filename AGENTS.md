@@ -113,7 +113,7 @@ New models require a `ModelSpec` entry in `src/finetune_library/registry.py` —
 |---|---|---|---|---|---|
 | Qwen3 dense | sdpa / fa2 | liger (auto) | auto | **off** | `backend: native`; Unsloth is opt-in, not required |
 | Gemma4 26B MoE | sdpa | liger | grouped_mm | **off** | Liger+compile incompatible |
-| OLMo 2/3 base | sdpa | liger (auto) | auto | **off** | Liger +15-32% vs native, loss parity checked |
+| OLMo 2/3 (incl. Think-DPO) | sdpa | liger (auto) | auto | **off** | Liger +14-32% vs native, loss parity checked |
 | Qwen3.5 35B MoE | fa3 | native | grouped_mm | **off** | FLA+TileLang, DeepEP or native all-to-all, EP4+FSDP |
 
 `backend: native` is the default everywhere, including all example SFT
@@ -129,7 +129,7 @@ configs under `configs/examples/`.
 | qwen3-32b (DDP) | 17.7k | 65 |
 | gemma4-26b-a4b-it | 34.7k | 75 |
 | gemma4-31b-it | 11.5k | 64 |
-| olmo3-32b-think-dpo | 15.8k | 65 |
+| olmo3-32b-think-dpo | 18.0k | 64 |
 | olmo3-1125-32b | 18.0k | 64 |
 | olmo3-1025-7b | 97.1k | 57 |
 | olmo2-1124-13b | 57.2k | 60 |

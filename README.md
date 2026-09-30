@@ -157,7 +157,8 @@ of `<ModelName>/` weight folders instead — only used if you set it.
 | `qwen3.5-35b-a3b` | EP4+FSDP, FA3+FLA, DeepEP or native all-to-all; see `configs/models/qwen35-35b-a3b-cpt.yaml` |
 | `gemma4-26b-a4b-it` | DDP MoE, Liger, grouped_mm |
 | `gemma4-31b-it` | DDP/HSDP dense |
-| `deepseek-r1-distill-llama-8b`, `olmo3-32b-think-dpo` | DDP native |
+| `deepseek-r1-distill-llama-8b` | DDP native |
+| `olmo3-32b-think-dpo` | DDP, Liger (auto) |
 | `olmo3-1125-32b`, `olmo3-1025-7b`, `olmo2-1124-13b`, `olmo2-1124-7b` | base models, DDP, Liger (auto); no chat template (see below) |
 
 Production profiles: `configs/models/*.yaml`. Example SFT configs (messages /
@@ -176,7 +177,7 @@ configs:
 | qwen3-32b (DDP) | 17.7k | 65 |
 | gemma4-26b-a4b-it | 34.7k | 75 |
 | gemma4-31b-it | 11.5k | 64 |
-| olmo3-32b-think-dpo | 15.8k | 65 |
+| olmo3-32b-think-dpo | 18.0k | 64 |
 | olmo3-1125-32b | 18.0k | 64 |
 | olmo3-1025-7b | 97.1k | 57 |
 | olmo2-1124-13b | 57.2k | 60 |
@@ -198,9 +199,8 @@ Measured 2026-09-30 (`configs/benchmarks/olmo{2,3}-*`, bf16, fused loss),
 native vs Liger model kernels: OLMo-3-7B 77.5k -> 97.1k tok/s, OLMo-2-7B
 77.6k -> 102k, OLMo-2-13B 44.5k -> 57.2k, OLMo-3-32B 15.7k -> 18.0k. Liger
 matches native on real text (step-1 loss within 2e-4, step-10 within 0.3%),
-so `model_kernels: auto` picks Liger for all `olmo2-*`/`olmo3-*` keys.
-`olmo3-32b-think-dpo-cpt.yaml` still pins `native` from its earlier gate,
-although its architecture is the same as `olmo3-1125-32b`.
+so `model_kernels: auto` picks Liger for all `olmo2-*`/`olmo3-*` keys,
+including `olmo3-32b-think-dpo` (15.7k -> 18.0k tok/s, `docs/validation.md`).
 
 ## Distributed correctness
 

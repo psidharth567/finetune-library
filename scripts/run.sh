@@ -137,7 +137,14 @@ else
   NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 fi
 
-EXTRA_ARGS_STR="${EXTRA_ARGS[*]:-}"
+# Shell-quote each argument: INNER_SCRIPT is re-parsed by bash inside the
+# container, so a plain "${EXTRA_ARGS[*]}" join splits multi-word arguments
+# (e.g. `merge --validation-text "The capital of France is"`).
+EXTRA_ARGS_STR=""
+for arg in "${EXTRA_ARGS[@]}"; do
+  EXTRA_ARGS_STR+=" $(printf '%q' "${arg}")"
+done
+CONFIG_ARG_Q="$(printf '%q' "${CONFIG_ARG}")"
 
 # train/benchmark run distributed via torchrun (scripts/production/launch-one-node.sh);
 # prepare-data/init are single-process finetune-lib invocations that take
@@ -151,13 +158,13 @@ EXTRA_ARGS_STR="${EXTRA_ARGS[*]:-}"
 # ignored for merge.
 case "${SUBCOMMAND}" in
   train|benchmark)
-    INNER_CMD="NPROC_PER_NODE=${NPROC_PER_NODE} scripts/production/launch-one-node.sh \"${CONFIG_ARG}\" ${SUBCOMMAND}"
+    INNER_CMD="NPROC_PER_NODE=${NPROC_PER_NODE} scripts/production/launch-one-node.sh ${CONFIG_ARG_Q} ${SUBCOMMAND}"
     ;;
   merge)
-    INNER_CMD="finetune-lib merge ${EXTRA_ARGS_STR}"
+    INNER_CMD="finetune-lib merge${EXTRA_ARGS_STR}"
     ;;
   *)
-    INNER_CMD="finetune-lib ${SUBCOMMAND} --config \"${CONFIG_ARG}\" ${EXTRA_ARGS_STR}"
+    INNER_CMD="finetune-lib ${SUBCOMMAND} --config ${CONFIG_ARG_Q}${EXTRA_ARGS_STR}"
     ;;
 esac
 
@@ -168,10 +175,14 @@ DOCKER_ARGS_LINE="--rm ${GPU_ARGS[*]} --ipc=host --ulimit memlock=-1 --shm-size=
 
 INNER_SCRIPT="set -euo pipefail; cd \"\${FINETUNE_LIBRARY_ROOT:-/opt/toolkit/finetune-library}\"; if [[ -f pyproject.toml ]]; then uv pip install -e . --no-deps -q 2>/dev/null || true; fi; ${INNER_CMD}"
 
+# INNER_SCRIPT goes inside single quotes below; escape any single quote the
+# %q-quoted arguments carry.
+INNER_SCRIPT_SQ="${INNER_SCRIPT//\'/\'\\\'\'}"
+
 run_cmd=$(cat <<CMD
 set -euo pipefail
 mkdir -p "${HF_HOME}" "${RUNTIME_HOME}/triton" "${RUNTIME_HOME}/inductor" "${RUNTIME_HOME}/uv" "${FINETUNE_LIBRARY_ROOT}/outputs"
-docker run ${DOCKER_ARGS_LINE} "${IMAGE}" bash -lc '${INNER_SCRIPT}' 2>&1 | tee "${LOG}"
+docker run ${DOCKER_ARGS_LINE} "${IMAGE}" bash -lc '${INNER_SCRIPT_SQ}' 2>&1 | tee "${LOG}"
 CMD
 )
 

@@ -31,7 +31,7 @@ distributed:
 runtime:
   backend: native
   attention: sdpa
-  model_kernels: native
+  model_kernels: auto
   loss: fused_linear_cross_entropy
   experts: auto
   torch_compile: false

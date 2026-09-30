@@ -144,6 +144,13 @@ The leading short-run candidates then completed the standard
 | OLMo-3-32B-Think-DPO | Native DDP, SDPA/fused loss | **15,489** | 14,588 | 64.57 |
 | Gemma-4-31B-it | Native DDP, SDPA/fused loss | **7,350** | 6,877 | 63.87 |
 
+Re-measured 2026-09-30 on the same 10-warm-up/50-measured-step gate
+(`configs/benchmarks/olmo3-32b-native-ddp{,-liger}-fused.yaml`), OLMo-3-32B-Think-DPO
+with Liger DDP ran **17,965** median tokens/s at 64.3 GiB vs 15,704 native, and matched
+native on real text (step-1 loss 1.0752 vs 1.0757, step-10 0.9531 vs 0.9513). The
+production profile now uses `model_kernels: auto` (Liger); the 10,034 row above is
+superseded.
+
 The 50-step Qwen sample was misleading for sustained training. Unsloth's
 offloaded-gradient path slowed after repeated epochs, so native DDP was run for
 the full stability horizon:
