@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from finetune_library.config import (
+    DataFormat,
     DistributedStrategy,
     ExperimentConfig,
     RuntimeBackend,
@@ -32,6 +33,14 @@ def apply_chat_template_override(tokenizer: Any, config: ExperimentConfig) -> No
     override = config.model.chat_template
     if override is not None:
         tokenizer.chat_template = override
+    # Base models (OLMo 2/3 base, ...) ship no chat template: fail before tokenizing.
+    uses_template = config.data.format in (DataFormat.MESSAGES, DataFormat.PREFERENCE)
+    if uses_template and not getattr(tokenizer, "chat_template", None):
+        raise ValueError(
+            f"{config.model.name} has no chat template, which data.format="
+            f"{config.data.format.value} needs; set model.chat_template or use "
+            "data.format prompt_completion/alpaca/text"
+        )
 
 
 def _cached_snapshot(
@@ -84,6 +93,8 @@ def _apply_liger_kernels(model: nn.Module, spec: ModelSpec) -> None:
         liger.apply_liger_kernel_to_llama(rope=True, swiglu=True, **common)
     elif spec.key.startswith("olmo3-"):
         liger.apply_liger_kernel_to_olmo3(rope=True, swiglu=True, **common)
+    elif spec.key.startswith("olmo2-"):
+        liger.apply_liger_kernel_to_olmo2(rope=True, swiglu=True, **common)
     elif spec.key.startswith("qwen3.5-"):
         if spec.moe:
             apply = getattr(liger, "apply_liger_kernel_to_qwen3_5_moe", None)
@@ -331,7 +342,8 @@ def load_runtime(
                 spec.key.startswith("qwen3-")
                 or spec.key.startswith("qwen3.5-")
                 or spec.key.startswith("gemma4-")
-                or spec.key in ("deepseek-r1-distill-llama-8b", "olmo3-32b-think-dpo")
+                or spec.key.startswith(("olmo2-", "olmo3-"))
+                or spec.key == "deepseek-r1-distill-llama-8b"
             )
             if liger_supported and importlib.util.find_spec("liger_kernel") is not None:
                 try:

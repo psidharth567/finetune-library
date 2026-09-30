@@ -158,6 +158,7 @@ of `<ModelName>/` weight folders instead — only used if you set it.
 | `gemma4-26b-a4b-it` | DDP MoE, Liger, grouped_mm |
 | `gemma4-31b-it` | DDP/HSDP dense |
 | `deepseek-r1-distill-llama-8b`, `olmo3-32b-think-dpo` | DDP native |
+| `olmo3-1125-32b`, `olmo3-1025-7b`, `olmo2-1124-13b`, `olmo2-1124-7b` | base models, DDP, Liger (auto); no chat template (see below) |
 
 Production profiles: `configs/models/*.yaml`. Example SFT configs (messages /
 prompt-completion formats): `configs/examples/`.
@@ -176,10 +177,30 @@ configs:
 | gemma4-26b-a4b-it | 34.7k | 75 |
 | gemma4-31b-it | 11.5k | 64 |
 | olmo3-32b-think-dpo | 15.8k | 65 |
+| olmo3-1125-32b | 18.0k | 64 |
+| olmo3-1025-7b | 97.1k | 57 |
+| olmo2-1124-13b | 57.2k | 60 |
+| olmo2-1124-7b | 102k | 57 |
 | qwen3.5-35b-a3b (FSDP+EP4, native all-to-all) | 18.0k | 75 |
 
 Qwen3-32B under FSDP/HSDP runs ~13.8k tok/s at 23-29 GiB peak (vs. DDP's
 17.7k/65 GiB) — prefer DDP when it fits in memory, FSDP/HSDP when memory-bound.
+
+### OLMo base models
+
+`olmo3-1125-32b`, `olmo3-1025-7b`, `olmo2-1124-13b` and `olmo2-1124-7b` are
+pretrained base checkpoints without a chat template. CPT (`text`) and SFT with
+`prompt_completion`/`alpaca` work as-is; `messages` SFT and DPO need
+`model.chat_template` (they fail at load time otherwise). OLMo 2 has a 4,096
+token context.
+
+Measured 2026-09-30 (`configs/benchmarks/olmo{2,3}-*`, bf16, fused loss),
+native vs Liger model kernels: OLMo-3-7B 77.5k -> 97.1k tok/s, OLMo-2-7B
+77.6k -> 102k, OLMo-2-13B 44.5k -> 57.2k, OLMo-3-32B 15.7k -> 18.0k. Liger
+matches native on real text (step-1 loss within 2e-4, step-10 within 0.3%),
+so `model_kernels: auto` picks Liger for all `olmo2-*`/`olmo3-*` keys.
+`olmo3-32b-think-dpo-cpt.yaml` still pins `native` from its earlier gate,
+although its architecture is the same as `olmo3-1125-32b`.
 
 ## Distributed correctness
 

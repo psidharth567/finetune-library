@@ -12,7 +12,7 @@ from finetune_library.runtime import _cached_snapshot
 
 def test_all_model_profiles_are_strict_and_registered() -> None:
     profiles = sorted(Path("configs/models").glob("*.yaml"))
-    assert len(profiles) == 8
+    assert len(profiles) == 12
     for profile in profiles:
         config = ExperimentConfig.from_yaml(profile)
         spec = resolve_model(config.model.name)
@@ -77,6 +77,7 @@ def test_dense_32b_profiles_use_qualified_ddp_and_fused_loss() -> None:
     profiles = {
         "qwen3-32b-cpt.yaml": RuntimeBackend.NATIVE,
         "olmo3-32b-think-dpo-cpt.yaml": RuntimeBackend.NATIVE,
+        "olmo3-1125-32b-cpt.yaml": RuntimeBackend.NATIVE,
         "gemma4-31b-it-cpt.yaml": RuntimeBackend.NATIVE,
     }
     for filename, backend in profiles.items():
@@ -124,3 +125,25 @@ def test_cached_snapshot_keeps_snapshot_path(
     assert _cached_snapshot("owner/model", "a" * 40, str(tmp_path)) == str(
         snapshot.absolute()
     )
+
+
+def test_base_models_without_chat_template_fail_loudly_for_chat_formats() -> None:
+    from types import SimpleNamespace
+
+    from finetune_library.runtime import apply_chat_template_override
+
+    cpt = ExperimentConfig.from_yaml("configs/models/olmo2-1124-7b-cpt.yaml")
+    apply_chat_template_override(SimpleNamespace(chat_template=None), cpt)
+
+    raw = ExperimentConfig.from_yaml("configs/examples/qwen3-8b-sft-messages.yaml").model_dump(
+        mode="json"
+    )
+    raw["model"]["name"] = "olmo2-1124-7b"
+    messages = ExperimentConfig.model_validate(raw)
+    with pytest.raises(ValueError, match="has no chat template"):
+        apply_chat_template_override(SimpleNamespace(chat_template=None), messages)
+
+    raw["model"]["chat_template"] = "{{ messages[0]['content'] }}"
+    tokenizer = SimpleNamespace(chat_template=None)
+    apply_chat_template_override(tokenizer, ExperimentConfig.model_validate(raw))
+    assert tokenizer.chat_template == "{{ messages[0]['content'] }}"

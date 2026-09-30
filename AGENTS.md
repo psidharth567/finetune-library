@@ -100,6 +100,10 @@ finetune_request:
 | `gemma4-31b-it` | google/gemma-4-31B-it | DDP/HSDP | `configs/models/gemma4-31b-it-cpt.yaml` |
 | `deepseek-r1-distill-llama-8b` | deepseek-ai/DeepSeek-R1-Distill-Llama-8B | DDP | `configs/models/deepseek-r1-distill-llama-8b-cpt.yaml` |
 | `olmo3-32b-think-dpo` | allenai/Olmo-3-32B-Think-DPO | DDP/HSDP | `configs/models/olmo3-32b-think-dpo-cpt.yaml` |
+| `olmo3-1125-32b` | allenai/Olmo-3-1125-32B | DDP/HSDP | `configs/models/olmo3-1125-32b-cpt.yaml` |
+| `olmo3-1025-7b` | allenai/Olmo-3-1025-7B | DDP | `configs/models/olmo3-1025-7b-cpt.yaml` |
+| `olmo2-1124-13b` | allenai/OLMo-2-1124-13B | DDP | `configs/models/olmo2-1124-13b-cpt.yaml` |
+| `olmo2-1124-7b` | allenai/OLMo-2-1124-7B | DDP | `configs/models/olmo2-1124-7b-cpt.yaml` |
 
 New models require a `ModelSpec` entry in `src/finetune_library/registry.py` — upgrading Transformers alone is not enough.
 
@@ -109,6 +113,7 @@ New models require a `ModelSpec` entry in `src/finetune_library/registry.py` —
 |---|---|---|---|---|---|
 | Qwen3 dense | sdpa / fa2 | liger (auto) | auto | **off** | `backend: native`; Unsloth is opt-in, not required |
 | Gemma4 26B MoE | sdpa | liger | grouped_mm | **off** | Liger+compile incompatible |
+| OLMo 2/3 base | sdpa | liger (auto) | auto | **off** | Liger +15-32% vs native, loss parity checked |
 | Qwen3.5 35B MoE | fa3 | native | grouped_mm | **off** | FLA+TileLang, DeepEP or native all-to-all, EP4+FSDP |
 
 `backend: native` is the default everywhere, including all example SFT
@@ -125,6 +130,10 @@ configs under `configs/examples/`.
 | gemma4-26b-a4b-it | 34.7k | 75 |
 | gemma4-31b-it | 11.5k | 64 |
 | olmo3-32b-think-dpo | 15.8k | 65 |
+| olmo3-1125-32b | 18.0k | 64 |
+| olmo3-1025-7b | 97.1k | 57 |
+| olmo2-1124-13b | 57.2k | 60 |
+| olmo2-1124-7b | 102k | 57 |
 | qwen3.5-35b-a3b (FSDP+EP4, native all-to-all) | 18.0k | 75 |
 
 Qwen3-32B under FSDP/HSDP: ~13.8k tok/s at 23-29 GiB (vs. DDP 17.7k/65 GiB) —
@@ -214,6 +223,13 @@ or rejected (`error`) — packed or not. Example:
 `configs/examples/qwen3-8b-sft-packed.yaml`. Check `prep_stats.json`
 (`dropped_overlength`, `examples_per_window`, `avg_fill_pct`) after
 `prepare-data`.
+
+## OLMo base models
+
+`olmo3-1125-32b`, `olmo3-1025-7b`, `olmo2-1124-*` have no chat template:
+use `text` / `prompt_completion` / `alpaca`, or set `model.chat_template` for
+`messages` SFT and DPO (otherwise they fail at load time). OLMo 2 context is
+4,096 tokens.
 
 ## DPO
 
