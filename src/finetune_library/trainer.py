@@ -15,9 +15,10 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from finetune_library.checkpoint import (
     load_adapter,
+    load_full_model_state,
     load_training_state,
-    save_adapter,
     save_checkpoint,
+    save_final_weights,
 )
 from finetune_library.config import DataFormat, ExperimentConfig, Task
 from finetune_library.data import (
@@ -252,9 +253,22 @@ def _write_metric(
             handle.write(json.dumps(metric, sort_keys=True) + "\n")
 
 
+def _debug_memory(context: DistributedContext, label: str) -> None:
+    import os
+
+    if os.environ.get("FINETUNE_DEBUG_MEMORY") and context.is_main and context.device.type == "cuda":
+        print(
+            f"[memory] {label}: allocated={torch.cuda.memory_allocated(context.device) / 2**30:.2f} GiB "
+            f"peak={torch.cuda.max_memory_allocated(context.device) / 2**30:.2f} GiB",
+            flush=True,
+        )
+
+
 def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[str, Any]:
     spec = resolve_model(config.model.name)
-    context = initialize_distributed(config.distributed, spec)
+    context = initialize_distributed(
+        config.distributed, spec, full_finetune=config.full_finetune
+    )
     output_dir = Path(config.training.output_dir)
     logger = setup_training_logger(output_dir, config.logging, rank=context.rank)
     events = EventLogger(output_dir, config.logging, rank=context.rank)
@@ -272,6 +286,7 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
             torch.backends.cuda.matmul.allow_tf32 = True
 
         runtime = load_runtime(config, spec, context)
+        _debug_memory(context, "model loaded")
         if config.packing_isolation() == "attention":
             # Isolated packing: softmax attention is isolated by position_ids;
             # linear-attention (GDN) layers need the boundaries passed explicitly.
@@ -297,31 +312,60 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                     moe_layout.local_num_experts,
                     moe_layout.a2a_backend,
                 )
-        peft_model, audit = inject_lora(
-            runtime.model,
-            spec,
-            config.lora,
-            expert_implementation=config.runtime.experts,
-            moe_layout=moe_layout,
-        )
-        if config.checkpoint.resume_from:
-            load_adapter(peft_model, config.checkpoint.resume_from)
+        dpo = config.task == Task.DPO
+        reference_model = None
+        if config.full_finetune:
+            peft_model = runtime.model
+            peft_model.requires_grad_(True)
+            master_dtype = (
+                torch.float32 if config.precision.master_dtype == "float32" else torch.bfloat16
+            )
+            trainable_parameters = sum(p.numel() for p in peft_model.parameters())
+            trainable_dtype: Any = master_dtype
+            audit_dict: dict[str, Any] = {
+                "finetune": "full",
+                "master_dtype": str(master_dtype),
+                "trainable_tensors": sum(1 for _ in peft_model.parameters()),
+                "trainable_parameters": trainable_parameters,
+            }
+            audit_text = (
+                f"Full fine-tuning: trainable_parameters={trainable_parameters:,} "
+                f"master_dtype={master_dtype}"
+            )
+            if dpo:
+                # Frozen copy of the initial weights. Loaded like the policy
+                # (same kernels/attention); FSDP shards it with the policy.
+                reference_model = load_runtime(config, spec, context).model
+                reference_model.requires_grad_(False)
+        else:
+            master_dtype = None
+            peft_model, audit = inject_lora(
+                runtime.model,
+                spec,
+                config.lora,
+                expert_implementation=config.runtime.experts,
+                moe_layout=moe_layout,
+            )
+            if config.checkpoint.resume_from:
+                load_adapter(peft_model, config.checkpoint.resume_from)
+            trainable_parameters = audit.trainable_parameters
+            trainable_dtype = audit.trainable_dtype
+            audit_dict = audit.as_dict()
+            audit_text = audit.format(verbose=config.runtime.verbose_lora_audit)
         _seed_everything(config.training.seed, context.rank)
         if context.is_main:
             output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / "lora_audit.json").write_text(
-                json.dumps(audit.as_dict(), indent=2, sort_keys=True) + "\n",
+            (output_dir / ("finetune_audit.json" if config.full_finetune else "lora_audit.json")).write_text(
+                json.dumps(audit_dict, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-            print(
-                audit.format(verbose=config.runtime.verbose_lora_audit),
-                flush=True,
-            )
+            print(audit_text, flush=True)
 
-        dpo = config.task == Task.DPO
         if dpo:
             assert config.preference is not None
-            training_model: Any = PreferenceModel(peft_model, config.preference)
+            training_model: Any = PreferenceModel(
+                peft_model, config.preference, reference_model=reference_model
+            )
         else:
             training_model = build_training_model(peft_model, config.runtime.loss)
         # For FSDP/HSDP, compile before sharding to avoid Dynamo tracing
@@ -340,15 +384,20 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                 expert_parallel_size=context.expert_parallel_size,
                 model_kernels=runtime.model_kernels,
             )
-            model = wrap_model(training_model, context, spec, config.distributed)
+            model = wrap_model(
+                training_model, context, spec, config.distributed, master_dtype=master_dtype
+            )
         else:
-            model = wrap_model(training_model, context, spec, config.distributed)
+            model = wrap_model(
+                training_model, context, spec, config.distributed, master_dtype=master_dtype
+            )
             model = maybe_compile(
                 model,
                 config,
                 expert_parallel_size=context.expert_parallel_size,
                 model_kernels=runtime.model_kernels,
             )
+        _debug_memory(context, "model wrapped")
         tracking.watch(model)
         optimizer = build_optimizer(model, config.optimizer, effective_lr=config.effective_learning_rate())
 
@@ -360,6 +409,8 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
         scheduler = build_scheduler(optimizer, config.scheduler, total_steps)
 
         position = TrainPosition()
+        if config.checkpoint.resume_from and config.full_finetune:
+            load_full_model_state(model, config.checkpoint.resume_from, context)
         if config.checkpoint.resume_from:
             restored = load_training_state(
                 checkpoint=config.checkpoint.resume_from,
@@ -381,8 +432,9 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
             "shard_size": context.shard_size,
             "replicate_size": context.replicate_size,
             "optimizer": config.optimizer.name.value,
-            "lora_dtype": str(audit.trainable_dtype),
-            "lora_trainable_parameters": audit.trainable_parameters,
+            "finetune": "full" if config.full_finetune else "lora",
+            "lora_dtype": str(trainable_dtype),
+            "lora_trainable_parameters": trainable_parameters,
         }
         if context.is_main:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -458,7 +510,11 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                 )
                 for micro_index, cpu_batch in enumerate(batches):
                     batch = _move_batch(cpu_batch, context.device)
-                    sync = micro_index == len(batches) - 1
+                    # Full fine-tuning under FSDP/HSDP reduce-scatters every
+                    # microbatch: skipping the sync keeps an unsharded fp32
+                    # gradient for the whole model (~55 GB for 13B). Gradients
+                    # are linear, so accumulating the sharded ones is identical.
+                    sync = micro_index == len(batches) - 1 or (config.full_finetune and is_sharded)
                     with maybe_no_sync(model, synchronize=sync):
                         with torch.autocast(
                             device_type=context.device.type,
@@ -486,14 +542,17 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                             local_loss_sum.add_(output.loss.detach().float() * denominator)
 
                 context.sync_replicated_gradients()
-                consolidate_tied_lora_gradients(model)
+                if not config.full_finetune:
+                    consolidate_tied_lora_gradients(model)
                 grad_norm: torch.Tensor | float | None = None
                 if config.training.max_grad_norm > 0:
                     grad_norm = context.clip_grad_norm(
                         model.parameters(),
                         config.training.max_grad_norm,
                     )
+                _debug_memory(context, f"step {position.step + 1} before optimizer.step")
                 optimizer.step()
+                _debug_memory(context, f"step {position.step + 1} after optimizer.step")
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 if end_event is not None:
@@ -611,7 +670,7 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
             "last_loss": last_metric.get("loss"),
         }
         if not benchmark and config.checkpoint.save_final:
-            save_adapter(
+            save_final_weights(
                 model,
                 runtime.tokenizer,
                 output_dir / "final",

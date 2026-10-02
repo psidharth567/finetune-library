@@ -374,13 +374,13 @@ def test_moe_reference_uses_policy_kernels_and_ignores_adapter(experts: str) -> 
             2 * len(rows),
         )
         with adapters_disabled(model._tuner_layers):
-            ref_fresh = model._sequence_logps(*call)
+            ref_fresh = model._sequence_logps(peft_model, *call)
         for name, parameter in peft_model.named_parameters():
             if "lora_B" in name or "lora_embedding_A" in name:
                 parameter.normal_(std=0.5)
         with adapters_disabled(model._tuner_layers):
-            ref_trained = model._sequence_logps(*call)
-        policy_trained = model._sequence_logps(*call)
+            ref_trained = model._sequence_logps(peft_model, *call)
+        policy_trained = model._sequence_logps(peft_model, *call)
     assert fresh.loss.item() == pytest.approx(math.log(2), abs=1e-6)
     assert fresh_stats["rewards_margin"] == 0.0  # exact: same kernels, zero deltas
     assert torch.equal(ref_fresh, ref_trained)

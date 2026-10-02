@@ -176,6 +176,7 @@ def initialize_distributed(
     spec: ModelSpec,
     *,
     timeout_minutes: int = 30,
+    full_finetune: bool = False,
 ) -> DistributedContext:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -203,7 +204,9 @@ def initialize_distributed(
 
     strategy = config.strategy
     if strategy == DistributedStrategy.AUTO:
-        strategy = spec.preferred_strategy
+        # Full fine-tuning replicates nothing it can shard: a DDP replica of a
+        # 13B model with fp32 master weights and Adam states needs ~220 GB.
+        strategy = DistributedStrategy.FSDP if full_finetune and world_size > 1 else spec.preferred_strategy
     if world_size == 1 and strategy == DistributedStrategy.DDP:
         # A registry DDP default should still permit a one-GPU development run.
         shard_size, replicate_size = 1, 1
@@ -387,7 +390,14 @@ def wrap_model(
     context: DistributedContext,
     spec: ModelSpec,
     config: DistributedConfig,
+    *,
+    master_dtype: torch.dtype | None = None,
 ) -> nn.Module:
+    """Wrap for DDP/FSDP2/HSDP. ``master_dtype`` (full fine-tuning) upcasts the
+    trainable parameters before sharding; compute stays bf16."""
+    if context.world_size == 1 or context.strategy == DistributedStrategy.DDP:
+        if master_dtype is not None:
+            _upcast_parameters(model, master_dtype)
     if context.world_size == 1:
         return model
     if context.strategy == DistributedStrategy.DDP:
@@ -410,6 +420,22 @@ def wrap_model(
         param_dtype=torch.bfloat16,
         reduce_dtype=reduce_dtype,
         output_dtype=torch.bfloat16,
+    )
+    # Full fine-tuning: do not cast decoder-layer inputs. FSDP2's pre-forward
+    # casts floating inputs (e.g. fp32 rotary cos/sin) to bf16 in the forward
+    # pass, but gradient-checkpoint recomputation skips that hook, so the
+    # recomputed graph sees fp32 inputs and torch.utils.checkpoint rejects the
+    # metadata mismatch. With bf16 masters (LoRA) the cast was a no-op for the
+    # residual stream; keep that path byte-identical.
+    layer_policy = (
+        MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=reduce_dtype,
+            output_dtype=torch.bfloat16,
+            cast_forward_inputs=False,
+        )
+        if master_dtype is not None
+        else policy
     )
     ignored = _noncontiguous_storage_groups(model)
     ep_params: set[nn.Parameter] = set()
@@ -444,14 +470,21 @@ def wrap_model(
                 continue
             unit_parameters = set(unit.parameters())
             unit_ignored = ignored.intersection(unit_parameters)
+            if master_dtype is not None:
+                # Upcast one unit at a time, just before fully_shard frees its
+                # unsharded storage: peak memory stays ~ the bf16 model plus
+                # one fp32 layer, not the whole model in fp32 on every rank.
+                _upcast_parameters(unit, master_dtype)
             fully_shard(
                 unit,
                 mesh=shard_mesh,
-                mp_policy=policy,
+                mp_policy=layer_policy,
                 reshard_after_forward=layer_reshard_after_forward,
                 ignored_params=unit_ignored or None,
             )
             shard_units.append(unit)
+    if master_dtype is not None:
+        _upcast_parameters(model, master_dtype)  # root-only params: embeddings, final norm, head
     fully_shard(
         model,
         mesh=shard_mesh,
@@ -465,6 +498,25 @@ def wrap_model(
     if config.fsdp_prefetch_layers > 0:
         _install_fsdp_prefetch(shard_units, config.fsdp_prefetch_layers)
     return model
+
+
+def _upcast_parameters(module: nn.Module, dtype: torch.dtype) -> None:
+    """Cast floating, not-yet-sharded parameters to ``dtype`` in place.
+
+    Frozen ones too (a full-FT DPO reference copy): FSDP2 needs one original
+    dtype per parameter group, and the root group holds both the policy's and
+    the reference's embeddings/head. bf16 -> fp32 -> bf16 is lossless, so the
+    reference still computes with exactly the initial policy weights. Tied
+    parameters are one Parameter object, so they stay tied.
+    """
+
+    for parameter in module.parameters():
+        if (
+            parameter.is_floating_point()
+            and parameter.dtype != dtype
+            and parameter.__class__.__name__ != "DTensor"
+        ):
+            parameter.data = parameter.data.to(dtype)
 
 
 def _install_fsdp_prefetch(shard_units: list[nn.Module], depth: int) -> None:

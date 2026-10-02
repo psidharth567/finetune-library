@@ -22,6 +22,10 @@
 #   LOG               Log file path (default: <repo>/logs/run-<ts>.log)
 #   RUN_AS_ROOT       1 = skip --user (default: 0, runs as invoking uid:gid)
 #   HF_TOKEN          Forwarded if set (gated models; local runs only, not over NODE=)
+#   NNODES            >1 = multi-node train/benchmark: run this script once per node (same NNODES,
+#                      MASTER_ADDR, MASTER_PORT; NODE_RANK 0..NNODES-1). Adds host networking and the
+#                      InfiniBand devices to the container (scripts/production/launch-multi-node.sh).
+#   NODE_RANK, MASTER_ADDR, MASTER_PORT (default 29500)   multi-node rendezvous (NNODES > 1)
 set -euo pipefail
 
 FINETUNE_LIBRARY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -156,9 +160,22 @@ CONFIG_ARG_Q="$(printf '%q' "${CONFIG_ARG}")"
 # required CONFIG positional is kept only for a uniform call signature
 # (`run.sh <placeholder> merge --checkpoint ... --output ...`); its value is
 # ignored for merge.
+NNODES="${NNODES:-1}"
+MULTINODE_ARGS=""
+if [[ "${NNODES}" -gt 1 ]]; then
+  : "${NODE_RANK:?NNODES > 1 requires NODE_RANK}" "${MASTER_ADDR:?NNODES > 1 requires MASTER_ADDR}"
+  # NCCL between nodes needs the host network and the RDMA devices.
+  MULTINODE_ARGS="--network=host --cap-add=IPC_LOCK"
+  [[ -d /dev/infiniband ]] && MULTINODE_ARGS+=" --device=/dev/infiniband"
+fi
+
 case "${SUBCOMMAND}" in
   train|benchmark)
-    INNER_CMD="NPROC_PER_NODE=${NPROC_PER_NODE} scripts/production/launch-one-node.sh ${CONFIG_ARG_Q} ${SUBCOMMAND}"
+    if [[ "${NNODES}" -gt 1 ]]; then
+      INNER_CMD="NNODES=${NNODES} NODE_RANK=${NODE_RANK} MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT:-29500} NPROC_PER_NODE=${NPROC_PER_NODE} scripts/production/launch-multi-node.sh ${CONFIG_ARG_Q} ${SUBCOMMAND}"
+    else
+      INNER_CMD="NPROC_PER_NODE=${NPROC_PER_NODE} scripts/production/launch-one-node.sh ${CONFIG_ARG_Q} ${SUBCOMMAND}"
+    fi
     ;;
   merge)
     INNER_CMD="finetune-lib merge${EXTRA_ARGS_STR}"
@@ -171,7 +188,7 @@ esac
 # Built as a single physical line per statement (no backslash-newline
 # continuations): those get consumed unpredictably once this text is re-read
 # from a heredoc/temp file, silently mangling the docker invocation.
-DOCKER_ARGS_LINE="--rm ${GPU_ARGS[*]} --ipc=host --ulimit memlock=-1 --shm-size=64g ${USER_ARGS[*]} ${MOUNT_ARGS[*]} -e HOME=/runtime_home -e USER=${INVOKER_USER} -e LOGNAME=${INVOKER_USER} -e TRITON_CACHE_DIR=/runtime_home/triton -e TORCHINDUCTOR_CACHE_DIR=/runtime_home/inductor -e UV_CACHE_DIR=/runtime_home/uv -e XDG_CACHE_HOME=/runtime_home -e HF_HOME=/cache -e HUGGINGFACE_HUB_CACHE=/cache/hub -e HF_HUB_OFFLINE=\"\${HF_HUB_OFFLINE:-1}\" -e FLA_SKIP_TRITON_AUTOTUNE=\"\${FLA_SKIP_TRITON_AUTOTUNE:-1}\" ${NCCL_ENV_ARGS[*]}"
+DOCKER_ARGS_LINE="--rm ${GPU_ARGS[*]} ${MULTINODE_ARGS} --ipc=host --ulimit memlock=-1 --shm-size=64g ${USER_ARGS[*]} ${MOUNT_ARGS[*]} -e HOME=/runtime_home -e USER=${INVOKER_USER} -e LOGNAME=${INVOKER_USER} -e TRITON_CACHE_DIR=/runtime_home/triton -e TORCHINDUCTOR_CACHE_DIR=/runtime_home/inductor -e UV_CACHE_DIR=/runtime_home/uv -e XDG_CACHE_HOME=/runtime_home -e HF_HOME=/cache -e HUGGINGFACE_HUB_CACHE=/cache/hub -e HF_HUB_OFFLINE=\"\${HF_HUB_OFFLINE:-1}\" -e FLA_SKIP_TRITON_AUTOTUNE=\"\${FLA_SKIP_TRITON_AUTOTUNE:-1}\" ${NCCL_ENV_ARGS[*]}"
 
 INNER_SCRIPT="set -euo pipefail; cd \"\${FINETUNE_LIBRARY_ROOT:-/opt/toolkit/finetune-library}\"; if [[ -f pyproject.toml ]]; then uv pip install -e . --no-deps -q 2>/dev/null || true; fi; ${INNER_CMD}"
 

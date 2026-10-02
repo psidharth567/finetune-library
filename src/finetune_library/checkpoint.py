@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import random
@@ -83,6 +84,119 @@ def save_adapter(
     )
 
 
+def policy_model(model: nn.Module) -> nn.Module:
+    """The trained Hugging Face model inside DDP / TrainingModel / PreferenceModel."""
+
+    inner = model.module if hasattr(model, "module") and isinstance(
+        getattr(model, "module"), nn.Module
+    ) else model
+    return cast(nn.Module, getattr(inner, "peft_model", inner))
+
+
+def save_full_model(
+    model: nn.Module,
+    tokenizer: Any,
+    destination: Path,
+    config: ExperimentConfig,
+    context: DistributedContext,
+    metadata: dict[str, Any],
+) -> None:
+    """Full fine-tuning: write a bf16 Hugging Face checkpoint (safetensors shards).
+
+    Every rank gathers each tensor (DTensor.full_tensor is collective); only
+    the main rank keeps it, on CPU, one tensor at a time on the GPU.
+    """
+
+    hf_model = policy_model(model)
+    state: dict[str, torch.Tensor] = {}
+    for name, tensor in hf_model.state_dict().items():
+        full = _full_tensor(tensor)
+        if context.is_main:
+            state[name] = full.to(torch.bfloat16) if full.is_floating_point() else full
+    if not context.is_main:
+        return
+    from huggingface_hub import save_torch_state_dict
+
+    destination.mkdir(parents=True, exist_ok=True)
+    save_torch_state_dict(state, destination, max_shard_size="5GB")
+    for shard in destination.glob("model*.safetensors*"):
+        shard.chmod(0o644)  # huggingface_hub writes 0600; servers may run as other users
+    hf_config = copy.deepcopy(cast(Any, hf_model).config)
+    hf_config.dtype = torch.bfloat16  # transformers 5 name (torch_dtype is its alias)
+    hf_config.use_cache = True
+    hf_config.save_pretrained(destination)
+    generation_config = getattr(hf_model, "generation_config", None)
+    if generation_config is not None:
+        generation_config.save_pretrained(destination)
+    tokenizer.save_pretrained(destination)
+    revision_value = metadata.get("revision") or config.model.revision
+    if revision_value is None:
+        from finetune_library.registry import resolve_model
+
+        revision_value = resolve_model(config.model.name).revision
+    config.with_model_revision(str(revision_value)).write_resolved(
+        destination / "resolved_config.json"
+    )
+    (destination / "run_metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def save_final_weights(
+    model: nn.Module,
+    tokenizer: Any,
+    destination: Path,
+    config: ExperimentConfig,
+    context: DistributedContext,
+    metadata: dict[str, Any],
+) -> None:
+    """The adapter (LoRA) or the whole model (full fine-tuning)."""
+
+    save = save_full_model if config.full_finetune else save_adapter
+    save(model, tokenizer, destination, config, context, metadata)
+
+
+def _local_trainable_state(model: nn.Module) -> dict[str, torch.Tensor]:
+    """This rank's shard of every trainable parameter (full fine-tuning resume)."""
+
+    state = {}
+    for name, parameter in policy_model(model).named_parameters():
+        if parameter.requires_grad:
+            local = (
+                cast(Any, parameter).to_local()
+                if parameter.__class__.__name__ == "DTensor"
+                else parameter
+            )
+            state[name] = local.detach().clone()
+    return state
+
+
+def load_full_model_state(model: nn.Module, checkpoint: str | Path, context: DistributedContext) -> None:
+    """Restore this rank's trainable-parameter shards saved by save_checkpoint."""
+
+    path = Path(checkpoint) / f"model_state_rank{context.rank:05d}.pt"
+    state = torch.load(path, map_location=context.device, weights_only=True)
+    parameters = dict(policy_model(model).named_parameters())
+    missing = [name for name, p in parameters.items() if p.requires_grad and name not in state]
+    unexpected = [name for name in state if name not in parameters]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"full-model resume mismatch: missing={missing[:8]} unexpected={unexpected[:8]}"
+        )
+    with torch.no_grad():
+        for name, saved in state.items():
+            parameter = parameters[name]
+            local = (
+                cast(Any, parameter).to_local()
+                if parameter.__class__.__name__ == "DTensor"
+                else parameter
+            )
+            if local.shape != saved.shape:
+                raise RuntimeError(f"full-model resume shape mismatch for {name}")
+            local.copy_(saved)
+
+
 def load_adapter(model: nn.Module, checkpoint: str | Path) -> None:
     from peft import set_peft_model_state_dict
     from safetensors.torch import load_file
@@ -161,8 +275,12 @@ def save_checkpoint(
     final = destination / f"trainer_state_rank{context.rank:05d}.pt"
     torch.save(rank_state, temporary)
     os.replace(temporary, final)
+    if config.full_finetune:
+        temporary = destination / f".model_state_rank{context.rank:05d}.tmp"
+        torch.save(_local_trainable_state(model), temporary)
+        os.replace(temporary, destination / f"model_state_rank{context.rank:05d}.pt")
     context.barrier()
-    save_adapter(model, tokenizer, destination, config, context, metadata)
+    save_final_weights(model, tokenizer, destination, config, context, metadata)
     context.barrier()
     if context.is_main:
         _prune_checkpoints(Path(config.training.output_dir), config.checkpoint.keep_last)

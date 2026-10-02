@@ -42,7 +42,7 @@ def _can_use_fused_adamw(parameters: list[nn.Parameter], requested: bool) -> boo
 
 
 def build_optimizer(model: nn.Module, config: OptimizerConfig, effective_lr: float | None = None) -> torch.optim.Optimizer:
-    """Build an unmodified, standard optimizer over the BF16 LoRA parameters."""
+    """Build an unmodified, standard optimizer over the trainable parameters (LoRA or full)."""
 
     parameters = _trainable_parameters(model)
     lr = config.learning_rate if config.learning_rate is not None else effective_lr
@@ -100,6 +100,7 @@ def build_scheduler(
     from transformers import (
         get_constant_schedule_with_warmup,
         get_cosine_schedule_with_warmup,
+        get_linear_schedule_with_warmup,
         get_wsd_schedule,
     )
 
@@ -108,6 +109,8 @@ def build_scheduler(
         return get_constant_schedule_with_warmup(optimizer, warmup)
     if config.name == "cosine":
         return get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
+    if config.name == "linear":
+        return get_linear_schedule_with_warmup(optimizer, warmup, total_steps)
     if config.name == "wsd":
         assert config.stable_steps is not None
         assert config.decay_steps is not None

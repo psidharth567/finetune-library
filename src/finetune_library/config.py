@@ -169,7 +169,7 @@ class OptimizerConfig(StrictModel):
 
 
 class SchedulerConfig(StrictModel):
-    name: Literal["cosine", "constant", "wsd"] = "cosine"
+    name: Literal["cosine", "linear", "constant", "wsd"] = "cosine"
     warmup_steps: int = Field(default=0, ge=0)
     warmup_ratio: float = Field(default=0.03, ge=0.0, lt=1.0)
     stable_steps: int | None = Field(default=None, ge=0)
@@ -185,6 +185,11 @@ class SchedulerConfig(StrictModel):
 class PrecisionConfig(StrictModel):
     model_dtype: Literal["bfloat16"] = "bfloat16"
     lora_dtype: Literal["bfloat16"] = "bfloat16"
+    # Full fine-tuning only (lora: null): dtype of the trainable weights the
+    # optimizer updates (compute stays bf16 via autocast / the FSDP mixed
+    # precision policy). float32 keeps small updates (LR ~1e-6..1e-5) that
+    # pure-bf16 weights round away; the optimizer states follow this dtype.
+    master_dtype: Literal["float32", "bfloat16"] = "float32"
     allow_tf32: bool = True
 
 
@@ -293,7 +298,8 @@ class ExperimentConfig(StrictModel):
     model: ModelConfig
     data: DataConfig
     training: TrainingConfig
-    lora: LoraSettings = LoraSettings()
+    # null = full fine-tuning: every parameter trainable, no adapter.
+    lora: LoraSettings | None = LoraSettings()
     optimizer: OptimizerConfig = OptimizerConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
     precision: PrecisionConfig = PrecisionConfig()
@@ -388,6 +394,33 @@ class ExperimentConfig(StrictModel):
                 "data.chunk_long_examples splits examples and is CPT-only; SFT examples are "
                 "never split or truncated (see data.sft_overlength)"
             )
+        return self
+
+    @property
+    def full_finetune(self) -> bool:
+        return self.lora is None
+
+    @model_validator(mode="after")
+    def validate_full_finetune(self) -> ExperimentConfig:
+        if not self.full_finetune:
+            return self
+        if self.optimizer.learning_rate is None:
+            raise ValueError(
+                "full fine-tuning (lora: null) requires optimizer.learning_rate; the registry "
+                "defaults are LoRA rates, 10-100x too high for full fine-tuning"
+            )
+        if self.runtime.loss == "fused_linear_cross_entropy":
+            raise ValueError(
+                "runtime.loss=fused_linear_cross_entropy is the fused LoRA head kernel; "
+                "full fine-tuning uses runtime.loss=auto/cross_entropy"
+            )
+        if self.distributed.strategy == DistributedStrategy.DDP:
+            raise ValueError(
+                "full fine-tuning keeps weights, gradients and optimizer states for every "
+                "parameter; use distributed.strategy=fsdp (one node) or hsdp (multi-node)"
+            )
+        if self.distributed.expert_parallel_size > 1:
+            raise ValueError("full fine-tuning is not supported with expert parallelism yet")
         return self
 
     def _validate_dpo(self) -> None:

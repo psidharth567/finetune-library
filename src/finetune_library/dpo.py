@@ -399,8 +399,23 @@ class PreferenceOutput:
     loss: torch.Tensor
 
 
+def causal_lm_of(model: nn.Module) -> Any:
+    """The Hugging Face causal LM inside a PEFT model, or the model itself."""
+
+    base_model = getattr(model, "base_model", None)
+    inner = getattr(base_model, "model", None)
+    if inner is not None and model.__class__.__name__.startswith("Peft"):
+        return inner
+    return model
+
+
 class PreferenceModel(nn.Module):
-    """Reference (adapter disabled, no grad) and policy passes plus the DPO loss.
+    """Reference (no grad) and policy passes plus the DPO loss.
+
+    LoRA: the reference is the same model with its adapters disabled. Full
+    fine-tuning: ``reference_model`` is a separate frozen copy of the initial
+    weights (a submodule, so FSDP shards it too; it has no trainable
+    parameters, so the optimizer, clipping and saves never see it).
 
     Per-step statistics are kept on ``last_stats`` rather than returned: FSDP2's
     ``output_dtype=bfloat16`` casts every floating tensor a root module returns,
@@ -410,20 +425,40 @@ class PreferenceModel(nn.Module):
 
     loss_implementation = "dpo_chunked_logprob"
 
-    def __init__(self, peft_model: nn.Module, preference: PreferenceConfig) -> None:
+    def __init__(
+        self,
+        peft_model: nn.Module,
+        preference: PreferenceConfig,
+        reference_model: nn.Module | None = None,
+    ) -> None:
         super().__init__()
         self.peft_model = peft_model
         self.preference = preference
         self.last_stats: torch.Tensor | None = None
+        self.reference_model = reference_model
+        self._tuner_layers: list[Any] = []
+        if reference_model is not None:
+            if any(parameter.requires_grad for parameter in reference_model.parameters()):
+                raise ValueError("the DPO reference model must be frozen")
+            return
         from peft.tuners.tuners_utils import BaseTunerLayer
 
         # Plain list, not a ModuleList: these are already submodules.
         self._tuner_layers = [m for m in peft_model.modules() if isinstance(m, BaseTunerLayer)]
         if not self._tuner_layers:
-            raise ValueError("preference training requires a LoRA-injected model")
+            raise ValueError(
+                "preference training requires a LoRA-injected model or a reference_model"
+            )
+
+    def train(self, mode: bool = True) -> PreferenceModel:
+        super().train(mode)
+        if self.reference_model is not None:
+            self.reference_model.eval()  # the reference never trains (dropout off)
+        return self
 
     def _sequence_logps(
         self,
+        model: nn.Module,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         targets: torch.Tensor,
@@ -432,7 +467,7 @@ class PreferenceModel(nn.Module):
         num_sequences: int,
         **kwargs: Any,
     ) -> torch.Tensor:
-        causal_lm = cast(Any, cast(Any, self.peft_model).base_model.model)
+        causal_lm = causal_lm_of(model)
         outputs = causal_lm.model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -479,9 +514,13 @@ class PreferenceModel(nn.Module):
         counts = torch.bincount(target_sequences, minlength=num_sequences).float()
 
         args = (input_ids, position_ids, targets, target_positions, target_sequences, num_sequences)
-        with torch.no_grad(), adapters_disabled(self._tuner_layers):
-            reference = self._sequence_logps(*args, **kwargs)
-        policy = self._sequence_logps(*args, **kwargs)
+        if self.reference_model is not None:
+            with torch.no_grad():
+                reference = self._sequence_logps(self.reference_model, *args, **kwargs)
+        else:
+            with torch.no_grad(), adapters_disabled(self._tuner_layers):
+                reference = self._sequence_logps(self.peft_model, *args, **kwargs)
+        policy = self._sequence_logps(self.peft_model, *args, **kwargs)
 
         losses, margin = preference_losses(
             policy[0::2],
