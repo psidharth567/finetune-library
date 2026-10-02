@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import random
@@ -316,6 +317,14 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
         reference_model = None
         if config.full_finetune:
             peft_model = runtime.model
+            if dpo:
+                # Frozen copy of the initial weights. A deepcopy, not a second
+                # load: kernel patches (Liger) applied at load time differ
+                # between a first and a later load (class-level patches catch
+                # modules a later load constructs, e.g. OLMo-2's q/k norms), and
+                # any kernel difference breaks the exact step-1 loss of ln 2.
+                reference_model = copy.deepcopy(peft_model)
+                reference_model.requires_grad_(False)
             peft_model.requires_grad_(True)
             master_dtype = (
                 torch.float32 if config.precision.master_dtype == "float32" else torch.bfloat16
@@ -332,11 +341,6 @@ def run_training(config: ExperimentConfig, *, benchmark: bool = False) -> dict[s
                 f"Full fine-tuning: trainable_parameters={trainable_parameters:,} "
                 f"master_dtype={master_dtype}"
             )
-            if dpo:
-                # Frozen copy of the initial weights. Loaded like the policy
-                # (same kernels/attention); FSDP shards it with the policy.
-                reference_model = load_runtime(config, spec, context).model
-                reference_model.requires_grad_(False)
         else:
             master_dtype = None
             peft_model, audit = inject_lora(
