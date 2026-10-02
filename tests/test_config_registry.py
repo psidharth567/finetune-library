@@ -50,6 +50,7 @@ def test_registry_contains_exact_production_set() -> None:
         "Qwen/Qwen3-30B-A3B-Base",
         "allenai/OLMo-2-1124-7B",
         "allenai/OLMo-2-1124-13B",
+        "local/talkie-1930-13b-base-hf",
     }
 
 

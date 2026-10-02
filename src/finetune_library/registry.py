@@ -296,6 +296,20 @@ _SPECS = (
         distributed_candidates=(DDP_8, HSDP_2, HSDP_4, FSDP_8),
         unsloth_compatible=False,
     ),
+    # talkie-lm/talkie-1930-13b-base ships a raw PyTorch checkpoint, not a Transformers repo. This is
+    # the HF conversion (remote code, trust_remote_code: true) made by
+    # sycophancy_training/talkie/hf/{convert.py,make_hf_cache.py}, which also places it in the HF cache
+    # as "local/talkie-1930-13b-base-hf"; the revision is that script's content hash, not a Hub commit.
+    # 13.3B dense, 40 heads without GQA, 4,096-token context, no chat template (set model.chat_template).
+    ModelSpec(
+        key="talkie-1930-13b-base",
+        repo_id="local/talkie-1930-13b-base-hf",
+        revision="440653661eae097aa82b92ca8569da79b8350f76",
+        architecture="dense",
+        layer_class="TalkieDecoderLayer",
+        preferred_strategy=DistributedStrategy.DDP,
+        unsloth_compatible=False,
+    ),
 )
 MODEL_REGISTRY = {spec.key: spec for spec in _SPECS}
 MODEL_REGISTRY.update({spec.repo_id: spec for spec in _SPECS})
