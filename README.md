@@ -305,6 +305,39 @@ fits at 74 GiB with the default `logprob_chunk_tokens: 256`; 1024 ran out of
 memory. It is close to the 80 GiB limit, so lower `max_seq_length` or the
 chunk if it fails.
 
+## Full fine-tuning (`lora: null`)
+
+Set `lora: null` to train every weight instead of a LoRA adapter, for `sft`,
+`cpt` and `dpo`, on any registered model.
+
+- **Precision:** fp32 master weights and optimizer state
+  (`precision.master_dtype: float32`, the default), bf16 compute through the
+  FSDP mixed-precision policy. The output is a bf16 Hugging Face checkpoint
+  (`final/`, 5 GB safetensors shards) that vLLM serves directly; there is no
+  merge step. Checkpoints also keep per-rank shards so `train` can resume.
+- **Requires** `distributed.strategy` `fsdp` or `hsdp` (`auto` picks FSDP),
+  an explicit `optimizer.learning_rate`, and no
+  `runtime.loss: fused_linear_cross_entropy` or expert parallelism.
+- **Memory:** gradients are reduce-scattered after every micro-batch, so
+  gradient accumulation does not hold an unsharded gradient. OLMo-2-13B
+  peaks at 35 GiB per GPU on 8xH100 (seq 4096, gradient checkpointing).
+- **DPO reference:** a frozen copy of the starting policy, so the step-1 loss
+  is exactly ln 2. This doubles weight memory (bf16 reference, sharded).
+- **Schedule:** `scheduler.name: linear` (warm-up, then linear decay to 0)
+  matches the Tulu-3/OLMo-2 recipes.
+- **Throughput:** OLMo-2-13B SFT ran at 18.5k tok/s on 1 node and 32k tok/s
+  on 2 nodes (HSDP).
+
+### Multi-node
+
+`NNODES>1` makes `scripts/run.sh` launch
+`scripts/production/launch-multi-node.sh` (torchrun, static rendezvous) with
+host networking and InfiniBand. Run it once per node with the same
+`NNODES`/`MASTER_ADDR`/`MASTER_PORT` and that node's `NODE_RANK`. For full
+fine-tuning use `distributed.strategy: hsdp` with `shard_size: 8` and
+`replicate_size: <NNODES>` (shard
+within a node, replicate across nodes); LoRA works with DDP.
+
 ## Opt-in knobs (off by default)
 
 - `distributed.reshard_after_forward`, `distributed.fsdp_prefetch_layers`,
